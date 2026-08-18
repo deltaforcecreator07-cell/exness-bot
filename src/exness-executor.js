@@ -20,6 +20,10 @@
  *      Server: GWT autocomplete (#server)                 Platform: MT4/MT5 toggle
  *      buttons: Demo | OK | Cancel
  *    GWT fields need REAL keyboard events (focus + type), not value-setter hacks.
+ *    IMPORTANT: the terminal UI (charts + "Market Watch") renders BEHIND the
+ *    login dialog, so "logged in" = login dialog NOT open AND terminal visible.
+ *    Checking just for the terminal gave a false "already logged in" and the
+ *    bot skipped the real login ("login dialog still open" error).
  * 5. Do NOT click "Demo" when logging into an existing Exness demo account —
  *    that opens MetaQuotes' demo-account CREATOR. Use Login/Password/Server + OK.
  * 6. MT5 accounts need the platform toggle flipped to MT5 ("Switch to the
@@ -79,15 +83,24 @@ async function waitFor(page, fn, timeout, label) {
   throw new Error(`waitFor: ${label || 'condition'} not met within ${timeout}ms`);
 }
 
+/**
+ * True when the "Connect to an Account" login dialog is open.
+ * CRITICAL: the terminal UI (charts, Market Watch) renders BEHIND this dialog,
+ * so you cannot tell "logged in" just from canvases/Market Watch — you must
+ * check that NO login dialog is open.
+ */
+async function isLoginDialogOpen(page) {
+  return page.evaluate(() => {
+    const hasPw = [...document.querySelectorAll('input')].some((i) =>
+      i.offsetParent !== null && i.type === 'password');
+    const hasOk = [...document.querySelectorAll('button')].some((b) =>
+      b.offsetParent !== null && /^OK$/i.test((b.innerText || '').trim()));
+    return hasPw && hasOk;
+  });
+}
+
 async function waitForLoginDialog(page, timeout = 60000) {
-  return waitFor(
-    page,
-    () => page.evaluate(() =>
-      [...document.querySelectorAll('input')].some((i) =>
-        i.offsetParent !== null && i.type === 'password')),
-    timeout,
-    'login dialog (password field)',
-  );
+  return waitFor(page, () => isLoginDialogOpen(page), timeout, 'login dialog');
 }
 
 async function isTerminalVisible(page) {
@@ -169,73 +182,134 @@ async function applyStealth(page) {
   });
 }
 
-async function loginFlow(page) {
-  const url = process.env.WEBTERMINAL_URL || 'https://metatraderweb.app/trade';
-  const login = process.env.EXNESS_LOGIN;
-  const pass = process.env.EXNESS_PASSWORD;
-  const server = process.env.EXNESS_SERVER || 'Exness-MT5Demo';
-  if (!login || !pass) throw new Error('EXNESS_LOGIN / EXNESS_PASSWORD are not set');
+/**
+ * If the "Switch to the MetaTrader 5 mode" confirmation modal is visible,
+ * click its Switch button (this refreshes the page into MT5 mode).
+ * Returns true if it clicked Switch.
+ */
+async function clickSwitchModalIfVisible(page) {
+  return page.evaluate(() => {
+    const m = [...document.querySelectorAll('.page-window.modal')]
+      .find(x => !/hidden/.test(x.className || ''));
+    if (!m) return false;
+    const title = (m.querySelector('.h')?.innerText || '').trim();
+    if (!/MetaTrader 5 mode/i.test(title)) return false;
+    const btn = [...m.querySelectorAll('button')]
+      .find(b => (b.innerText || '').trim() === 'Switch');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+}
 
-  console.log('[exness] opening', url);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await sleep(4000);
+/** Wait (up to timeout) for the login dialog to reappear OR the terminal to be ready. */
+async function waitAfterSwitch(page, timeout = 60000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const dlg = await isLoginDialogOpen(page);
+    if (dlg) { console.log('[exness] login dialog reappeared after MT5 switch'); return; }
+    const term = await isTerminalVisible(page);
+    if (term && !(await isLoginDialogOpen(page))) { console.log('[exness] terminal ready after MT5 switch'); return; }
+    await sleep(1500);
+  }
+  throw new Error('page did not become ready after MT5 switch');
+}
 
-  // Already logged in thanks to the persisted browser profile?
-  if (await isTerminalVisible(page)) {
-    console.log('[exness] persisted session: already inside the terminal');
+/** MT4 -> MT5 platform switch. MT5 accounts need the terminal in MT5 mode;
+ *  the app shows a "Switch to the MetaTrader 5 mode" modal when it detects an
+ *  MT5 server — clicking its Switch refreshes the page into MT5 mode. */
+async function switchToMT5(page) {
+  const isMT5 = await page.evaluate(() => {
+    // MT5 mode shows a checked mt5-platform radio / label
+    const r5 = document.querySelector('input[id*="mt5"][type="radio"]');
+    if (r5 && r5.offsetParent !== null && r5.checked) return true;
+    const lbl5 = [...document.querySelectorAll('label')]
+      .find(l => l.offsetParent !== null && /MetaTrader\s*5/i.test(l.innerText || ''));
+    return !!lbl5;
+  });
+  if (isMT5) { console.log('[exness] platform already MT5'); return; }
+
+  // modal already visible?
+  if (await clickSwitchModalIfVisible(page)) {
+    console.log('[exness] clicked Switch (modal was open)');
+    await waitAfterSwitch(page);
     return;
   }
-
-  console.log('[exness] waiting for the login dialog (can take 10-40s on first boot)...');
-  await waitForLoginDialog(page, 90000);
-
-  // --- MT4 -> MT5 platform toggle (needed for MT5 accounts) ---
-  try {
-    const flipped = await page.evaluate(() => {
-      const t = [...document.querySelectorAll('td, span, div')]
-        .filter((d) => d.offsetParent !== null && d.childElementCount === 0)
-        .map((d) => (d.innerText || '').trim());
-      const i = t.findIndex((x) => x === 'Platform:');
-      return i >= 0 ? t[i + 1] : null;
-    });
-    if (/MetaTrader\s*4/i.test(flipped || '')) {
-      console.log('[exness] dialog is in MT4 mode, switching to MT5...');
-      await clickVisibleText(page, 'Switch to the MetaTrader 5 mode', 5000)
-        .catch(async () => {
-          const btn = await page.evaluateHandle(() =>
-            [...document.querySelectorAll('button')]
-              .find((b) => b.offsetParent !== null && (b.innerText || '').trim() === 'Switch') || null);
-          const el = btn.asElement();
-          if (el) await el.click({ delay: 40 });
-          else throw new Error('no MT5 switch control found');
-        });
-      await sleep(3000);
-      console.log('[exness] platform switch clicked');
-    }
-  } catch (e) {
-    console.warn('[exness] could not verify/switch platform:', e.message);
-  }
-
-  // --- Server (GWT autocomplete) ---
-  const sel = loadSelectors();
-  const serverField = await page.$(sel.serverInput);
-  if (serverField) {
-    await clearAndType(page, serverField, server);
-    await sleep(2500);
-    // commit: click the exact suggestion if it appeared, else press Enter
-    const picked = await page.evaluate((srv) => {
-      const el = [...document.querySelectorAll('div, span, td, li')]
-        .filter((d) => d.offsetParent !== null && d.childElementCount === 0)
-        .find((d) => (d.innerText || '').trim() === srv);
-      if (el) { el.click(); return true; }
-      return false;
-    }, server);
-    if (!picked) await page.keyboard.press('Enter');
+  // try to find a visible "Switch to the MetaTrader 5 mode" trigger
+  const opened = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('*')]
+      .filter(e => e.offsetParent !== null)
+      .find(e => /switch to the metatrader 5 mode/i.test((e.innerText || '').trim()) && e.children.length === 0);
+    if (el) { el.click(); return true; }
+    return false;
+  });
+  if (opened) {
+    console.log('[exness] found switch trigger, clicked it');
     await sleep(1500);
-    console.log('[exness] server field set to', server);
+    if (await clickSwitchModalIfVisible(page)) {
+      console.log('[exness] clicked Switch in confirmation modal');
+      await waitAfterSwitch(page);
+    }
   } else {
-    console.warn('[exness] server input not found (selector: ' + sel.serverInput + ')');
+    console.log('[exness] no switch trigger found — the app will prompt when an MT5 server is entered');
   }
+}
+
+/**
+ * Set the Server field in the GWT autocomplete (VERIFIED sequence):
+ * 1. focus + type a seed to open the datalist
+ * 2. click the exact option if it exists (this seeds the combo's model)
+ * 3. select-all + backspace + type the FULL server name + Enter
+ * (The plain clearAndType left a "MetaQuotes-Dem" prefix and kept OK disabled.)
+ */
+async function setServerField(page, server) {
+  const sel = loadSelectors();
+  const field = await page.$(sel.serverInput);
+  if (!field) { console.warn('[exness] server input not found (selector: ' + sel.serverInput + ')'); return; }
+
+  await field.click();
+  await sleep(300);
+  // seed: type something to open the datalist, then pick an exact option if present
+  const seed = server.slice(0, 12);
+  await page.keyboard.type(seed, { delay: 40 });
+  await sleep(1800);
+  const picked = await page.evaluate((srv) => {
+    const el = [...document.querySelectorAll('.datalist .option')]
+      .find(o => (o.innerText || '').trim() === srv);
+    if (el) { el.click(); return true; }
+    return false;
+  }, server);
+  if (picked) console.log('[exness] server option selected:', server);
+  await sleep(500);
+
+  // select-all + backspace + type full server + Enter (verified: clean value, OK enables)
+  await page.evaluate(() => { const el = document.querySelector('#server'); if (el) { el.focus(); el.select(); } });
+  await page.keyboard.press('Backspace');
+  await page.keyboard.type(String(server), { delay: 50 });
+  await sleep(1500);
+  await page.keyboard.press('Enter');
+  await sleep(1500);
+  const v = await page.evaluate(() => document.querySelector('#server')?.value);
+  console.log('[exness] server field ->', JSON.stringify(v));
+}
+
+/** Wait for the OK button to become enabled (it starts disabled until valid input). */
+async function waitForOkEnabled(page, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const st = await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('button')]
+        .find(b => b.offsetParent !== null && (b.innerText || '').trim() === 'OK');
+      return btn ? !btn.disabled : false;
+    });
+    if (st) return true;
+    await sleep(800);
+  }
+  return false;
+}
+
+/** Fill the login dialog (server / login / password) and click OK (waits for enable). */
+async function performLogin(page, login, pass, server) {
+  await setServerField(page, server);
 
   // --- Login + Password (real keystrokes, GWT needs them) ---
   await page.evaluate(() => {
@@ -251,35 +325,98 @@ async function loginFlow(page) {
     if (pw) pw.focus();
   });
   await page.keyboard.type(String(pass), { delay: 50 });
-  await sleep(500);
+  await sleep(800);
 
-  // --- OK ---
+  // --- OK (wait until enabled, then click) ---
+  const enabled = await waitForOkEnabled(page);
+  console.log('[exness] OK enabled:', enabled);
+  if (!enabled) {
+    await screenshot(page, 'ok-disabled');
+    throw new Error('OK button never enabled — check server name + credentials fields');
+  }
   const okClicked = await page.evaluate(() => {
     const el = [...document.querySelectorAll('button')]
-      .find((b) => b.offsetParent !== null && (b.innerText || '').trim() === 'OK');
+      .find((b) => b.offsetParent !== null && (b.innerText || '').trim() === 'OK' && !b.disabled);
     if (el) { el.click(); return true; }
     return false;
   });
   console.log('[exness] OK clicked:', okClicked);
   if (!okClicked) throw new Error('OK button not found in login dialog');
+}
 
-  // --- wait for terminal or auth error ---
-  await sleep(6000);
-  const terminalVisible = await isTerminalVisible(page);
-  if (terminalVisible) {
-    console.log('[exness] ✅ logged in, terminal ready');
+async function loginFlow(page) {
+  const url = process.env.WEBTERMINAL_URL || 'https://metatraderweb.app/trade';
+  const login = process.env.EXNESS_LOGIN;
+  const pass = process.env.EXNESS_PASSWORD;
+  const server = process.env.EXNESS_SERVER || 'Exness-Trial16';
+  if (!login || !pass) throw new Error('EXNESS_LOGIN / EXNESS_PASSWORD are not set');
+
+  // Some users write "Exness-MT5Trial16" but the real server is "Exness-Trial16"
+  // (the "MT5" prefix doesn't exist in the terminal's server list — verified).
+  // Build a fallback chain: configured server, then the same name minus "MT5".
+  const servers = [server];
+  const alt = String(server).replace(/-?MT5/i, '-').replace(/^[-_]+/, '').replace(/-+$/, '');
+  if (alt !== server && alt) servers.push(alt);
+  console.log('[exness] server candidates:', servers.join(' | '));
+
+  console.log('[exness] opening', url);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await sleep(5000);
+
+  // Already logged in? ONLY if no login dialog is open AND the terminal UI is
+  // visible. The terminal UI renders behind the login dialog, so checking just
+  // for the terminal is NOT enough (this caused "login dialog still open").
+  const dialogOpen = await isLoginDialogOpen(page);
+  if (!dialogOpen && (await isTerminalVisible(page))) {
+    console.log('[exness] persisted session: already inside the terminal (no login dialog)');
     return;
   }
-  const authError = await page.evaluate(() => {
-    const t = document.body ? document.body.innerText : '';
-    return /Authorization Failed|invalid login|incorrect/i.test(t);
-  });
-  if (authError) {
-    await screenshot(page, 'auth-failed');
-    throw new Error('Authorization Failed — check EXNESS_LOGIN/PASSWORD/SERVER');
+
+  console.log('[exness] waiting for the login dialog (can take 10-40s on first boot)...');
+  await waitForLoginDialog(page, 90000);
+
+  // Attempt login (with retry + server fallback) and VERIFY the dialog closed.
+  // Handles the MT5 flow: fill -> OK -> app asks to switch to MT5 -> Switch ->
+  // page reloads in MT5 mode -> fill again -> OK -> terminal.
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const srv = servers[Math.min(attempt - 1, servers.length - 1)];
+    console.log(`[exness] login attempt ${attempt}/4 (server ${srv})`);
+    await performLogin(page, login, pass, srv);
+    await sleep(4000);
+
+    // If the app asks to switch to MT5 mode (MT5 server detected), do it and
+    // wait for the reload; then loop again to re-login in MT5 mode.
+    if (await clickSwitchModalIfVisible(page)) {
+      console.log('[exness] MT5 switch requested after OK — refreshing into MT5 mode...');
+      try { await waitAfterSwitch(page, 60000); } catch (e) { console.warn('[exness] wait after switch:', e.message); }
+      await sleep(2000);
+      continue; // next attempt logs in on the (now MT5) dialog
+    }
+
+    await sleep(2000);
+    const stillOpen = await isLoginDialogOpen(page);
+    const terminalOk = await isTerminalVisible(page);
+    if (!stillOpen && terminalOk) {
+      console.log('[exness] ✅ logged in, terminal ready');
+      return;
+    }
+
+    if (stillOpen) {
+      const authErr = await page.evaluate(() => {
+        const t = document.body ? document.body.innerText : '';
+        return /Authorization Failed|invalid login|incorrect|wrong password/i.test(t);
+      });
+      if (authErr) {
+        await screenshot(page, 'auth-failed');
+        throw new Error('Authorization Failed — check EXNESS_LOGIN/PASSWORD/SERVER. NOTE: "Exness-MT5Trial16" does NOT exist — use the exact server from your Personal Area (e.g. "Exness-Trial16").');
+      }
+      console.warn(`[exness] login attempt ${attempt} (server ${srv}) did not complete (dialog still open), retrying...`);
+    } else {
+      console.warn(`[exness] login attempt ${attempt}: dialog closed but terminal not detected, retrying...`);
+    }
   }
   await screenshot(page, 'post-login-unknown');
-  throw new Error('Login did not complete (see screenshot runtime/screenshots)');
+  throw new Error('Login did not complete after 4 attempts (see screenshot runtime/screenshots). Verify EXNESS_SERVER is the EXACT server name from your Personal Area (e.g. "Exness-Trial16", not "Exness-MT5Trial16").');
 }
 
 async function loginPage() {
@@ -347,10 +484,7 @@ async function placeOrder(page, sig) {
   const { action, pair, lot, sl, tp } = sig;
 
   // 0) sanity: if the login dialog is somehow still open, stop
-  const dialogOpen = await page.evaluate(() =>
-    [...document.querySelectorAll('input')].some((i) => i.offsetParent !== null && i.type === 'password') &&
-    [...document.querySelectorAll('button')].some((b) => b.offsetParent !== null && (b.innerText || '').trim() === 'OK'));
-  if (dialogOpen) throw new Error('login dialog still open — could not reach the terminal');
+  if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
 
   // 1) open the order ticket (dblclick symbol in Market Watch, else F9, else New Order button)
   await openOrderTicket(page, pair);
@@ -438,4 +572,6 @@ async function executeTrade(signal, timeoutMs = 180000) {
 module.exports = {
   executeTrade, loginPage, launchBrowser, applyStealth, DEFAULT_SELECTORS, loadSelectors,
   clickVisibleText, clearAndType, fieldForLabel, screenshot, sleep,
+  isLoginDialogOpen, isTerminalVisible, waitForLoginDialog, clickSwitchModalIfVisible,
+  waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
 };
