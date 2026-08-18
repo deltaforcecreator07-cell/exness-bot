@@ -188,7 +188,7 @@ async function channelAllowed(jid) {
   }
   try {
     const meta = await sock.newsletterMetadata('jid', jid);
-    const name = (meta && (meta.name || meta.thread_metadata?.name || meta.state?.name)) || '';
+    const name = channelNameFromMeta(meta);
     channelNameCache.set(jid, { name, ts: Date.now() });
     const ok = allowedChannelNames.some(n => name.toLowerCase().includes(n));
     console.log(`[whatsapp] channel "${name}" (${jid}) allowed=${ok}`);
@@ -197,6 +197,21 @@ async function channelAllowed(jid) {
     console.warn('[whatsapp] cannot resolve channel metadata for', jid, e.message);
     return false;
   }
+}
+
+/**
+ * Extract the display name from newsletter metadata.
+ * The name field can be a plain string OR an object {id, text, update_time}
+ * (as seen in WhatsApp's channel metadata) — handle both.
+ */
+function channelNameFromMeta(meta) {
+  if (!meta) return '';
+  const pick = (v) => {
+    if (typeof v === 'string') return v;
+    if (v && typeof v.text === 'string') return v.text;
+    return '';
+  };
+  return pick(meta.name) || pick(meta.thread_metadata?.name) || pick(meta.state?.name) || '';
 }
 
 async function groupAllowed(jid) {
