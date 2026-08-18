@@ -50,7 +50,7 @@ const allowedGroupJids = new Set(
   (process.env.ALLOWED_GROUP_JIDS || '').split(',').map(s => s.trim()).filter(Boolean),
 );
 
-// WhatsApp Channel(s): bare id ("0029VarqpJRCXC3E4nNcRv05") and/or full jid ("...@newsletter")
+// WhatsApp Channel(s): bare invite code ("0029VarqpJRCXC3E4nNcRv05") or full jid ("120363403901744631@newsletter")
 function channelConfig() {
   const ids = (process.env.ALLOWED_CHANNELS || '')
     .split(',').map(s => s.trim()).filter(Boolean)
@@ -59,8 +59,42 @@ function channelConfig() {
     .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   return { jids: ids, names };
 }
-const allowedChannelIds = channelConfig().jids;
+const configuredChannelIds = channelConfig().jids;
 const allowedChannelNames = channelConfig().names;
+
+// Resolved real channel JIDs (invite codes resolved via newsletterMetadata).
+// Filled in at connect time; used for follow/unmute AND for message matching.
+let resolvedChannelIds = [...configuredChannelIds];
+
+/**
+ * Resolve configured channel invite codes to real channel JIDs.
+ * The whatsapp.com/channel/<code> link gives an INVITE code; the real JID is
+ * numeric (e.g. 120363403901744631@newsletter). newsletterMetadata('invite', code)
+ * returns the metadata including .id (the real JID). Numeric jids pass through.
+ */
+async function resolveConfiguredChannels() {
+  if (!sock) return;
+  const out = [];
+  for (const id of configuredChannelIds) {
+    if (/^\d+@newsletter$/.test(id)) { out.push(id); continue; }
+    const code = id.replace(/@newsletter$/, '');
+    try {
+      const meta = await sock.newsletterMetadata('invite', code);
+      if (meta && meta.id) {
+        console.log(`[whatsapp] resolved channel invite "${code}" -> ${meta.id} (${meta.name || '?'})`);
+        out.push(meta.id);
+      } else {
+        console.warn(`[whatsapp] invite "${code}" resolved to nothing — keeping as-is`);
+        out.push(id);
+      }
+    } catch (e) {
+      console.warn(`[whatsapp] could not resolve channel invite "${code}": ${e.message}`);
+      out.push(id);
+    }
+  }
+  resolvedChannelIds = [...new Set(out)];
+  console.log('[whatsapp] channel jids:', resolvedChannelIds.join(', '));
+}
 
 let sock = null;
 let pending = null; // { sig, at }
@@ -120,13 +154,16 @@ async function startWhatsApp() {
 
 /** Follow + unmute configured channels so their messages arrive. */
 async function subscribeToChannels() {
-  if (!allowedChannelIds.length) return;
-  for (const jid of allowedChannelIds) {
-    try { await sock.newsletterFollow(jid); } catch (e) { console.warn('[whatsapp] follow channel', jid, 'failed:', e.message); }
+  if (!configuredChannelIds.length) return;
+  await resolveConfiguredChannels();
+  for (const jid of resolvedChannelIds) {
+    try { await sock.newsletterFollow(jid); console.log(`[whatsapp] following channel ${jid}`); }
+    catch (e) { console.warn(`[whatsapp] follow channel ${jid}: ${e.message} (already following? that's fine)`); }
     await sleep(500);
-    try { await sock.newsletterUnmute(jid); } catch (e) { console.warn('[whatsapp] unmute channel', jid, 'failed:', e.message); }
+    try { await sock.newsletterUnmute(jid); console.log(`[whatsapp] unmuted channel ${jid}`); }
+    catch (e) { console.warn(`[whatsapp] unmute channel ${jid}: ${e.message}`); }
   }
-  console.log('[whatsapp] channels configured:', allowedChannelIds.join(', '));
+  console.log('[whatsapp] channels configured:', resolvedChannelIds.join(', '));
 }
 
 async function stopWhatsApp() {
@@ -139,7 +176,10 @@ function isChannel(jid) { return isJidNewsletter(jid); }
 
 async function channelAllowed(jid) {
   if (!isChannel(jid)) return false;
-  if (allowedChannelIds.includes(jid)) return true;
+  // 1) direct JID match against configured + resolved channel JIDs (fastest, most reliable)
+  if (resolvedChannelIds.includes(jid)) return true;
+  if (configuredChannelIds.includes(jid)) return true;
+  // 2) name match (belt-and-braces when JID isn't known yet)
   if (allowedChannelNames.length === 0) return false;
 
   const cached = channelNameCache.get(jid);
@@ -148,7 +188,7 @@ async function channelAllowed(jid) {
   }
   try {
     const meta = await sock.newsletterMetadata('jid', jid);
-    const name = (meta && (meta.name || meta.state?.name)) || '';
+    const name = (meta && (meta.name || meta.thread_metadata?.name || meta.state?.name)) || '';
     channelNameCache.set(jid, { name, ts: Date.now() });
     const ok = allowedChannelNames.some(n => name.toLowerCase().includes(n));
     console.log(`[whatsapp] channel "${name}" (${jid}) allowed=${ok}`);
