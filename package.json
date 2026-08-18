@@ -1,0 +1,23 @@
+{
+  "name": "exness-signal-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WhatsApp signal -> risk check -> Exness MT5 demo trade (headless browser) on Render free tier",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dump-dom": "node src/dump-dom.js",
+    "test": "node tests/parser-test.js && node tests/manage-test.js && node tests/config-test.js",
+    "test:wa": "node tests/wa-connect-test.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "dotenv": "^16.4.5",
+    "pino": "^9.5.0",
+    "puppeteer": "^23.11.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
