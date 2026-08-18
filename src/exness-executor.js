@@ -150,13 +150,11 @@ async function launchBrowser() {
     '--mute-audio',
     '--disable-blink-features=AutomationControlled', // hides automation from the app
   ];
-  const base = { args, userDataDir: PROFILE_DIR };
-  const headlessMode = process.env.PUPPETEER_HEADLESS || 'shell';
-  try {
-    return await puppeteer.launch({ ...base, headless: headlessMode });
-  } catch {
-    return await puppeteer.launch({ ...base, headless: 'new' });
-  }
+  // IMPORTANT (Render free = 512 MB disk): only chrome-headless-shell is
+  // installed (see package.json postinstall). Full Chrome (~340 MB) does not
+  // fit alongside node_modules, so we NEVER fall back to it.
+  const base = { args, userDataDir: PROFILE_DIR, headless: 'shell' };
+  return puppeteer.launch(base);
 }
 
 /** Anti-bot fingerprint cleanup — REQUIRED or the terminal stalls at "Loading...". */
