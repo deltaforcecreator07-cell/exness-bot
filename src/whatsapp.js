@@ -255,23 +255,28 @@ function extractText(msg) {
 }
 
 async function onMessage(msg) {
-  if (msg.key.fromMe) return;
   const jid = msg.key.remoteJid || '';
   const text = extractText(msg);
   if (!text || !text.trim()) return;
 
   const sender = msg.key.participant || jid;
-  const isChannelMsg = isChannel(jid);
-  const isGroup = jid.endsWith('@g.us');
-  const isDM = jid.endsWith('@s.whatsapp.net');
-  const isCommand = /^\/(status|help|positions|retake|retry|trade)\b/i.test(text.trim());
 
-  // commands: allowed senders, anywhere
+  // Commands (/trade, /retake, /status, ...) are handled FIRST — before the
+  // fromMe filter — so the owner can DM commands to their own number (self-DM)
+  // and they still work. (When you message yourself, fromMe is true because
+  // the message comes from the bot's own linked account.)
+  const isCommand = /^\/(status|help|positions|retake|retry|trade)\b/i.test(text.trim());
   if (isCommand && senderAllowed(sender)) {
     const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
     return;
   }
+
+  if (msg.key.fromMe) return; // ignore own messages after command handling
+
+  const isChannelMsg = isChannel(jid);
+  const isGroup = jid.endsWith('@g.us');
+  const isDM = jid.endsWith('@s.whatsapp.net');
   if (isDM) return; // DMs are never signal sources
 
   // ---- signal source: allowed CHANNEL (primary) or allowed GROUP ----
