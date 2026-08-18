@@ -66,4 +66,29 @@ function closeTracked(pair) {
 function listPositions() { return load(); }
 function latestPosition() { const l = load(); return l.length ? l[l.length - 1] : null; }
 
-module.exports = { addPosition, updatePosition, closeTracked, listPositions, latestPosition };
+/* ---------------- last-signal memory (for /retake) ---------------- */
+
+const LAST_SIGNAL_FILE = path.join(STATE_DIR, 'last-signal.json');
+
+/** Remember the most recent trade signal, so a missed trade can be retaken. */
+function saveLastSignal(sig) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(LAST_SIGNAL_FILE, JSON.stringify({ sig, at: Date.now() }));
+  } catch (e) { console.warn('[positions] saveLastSignal failed:', e.message); }
+}
+
+/** Load the last signal (null if none / expired). */
+function loadLastSignal(maxAgeMs = 24 * 60 * 60 * 1000) {
+  try {
+    const d = JSON.parse(fs.readFileSync(LAST_SIGNAL_FILE, 'utf8'));
+    if (!d || !d.sig) return null;
+    if (Date.now() - (d.at || 0) > maxAgeMs) return null;
+    return d.sig;
+  } catch { return null; }
+}
+
+module.exports = {
+  addPosition, updatePosition, closeTracked, listPositions, latestPosition,
+  saveLastSignal, loadLastSignal,
+};
