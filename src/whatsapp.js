@@ -37,7 +37,7 @@ const { senderAllowed, isProvider, validateSignal, markExecuted, todayStats } = 
 const { execute } = require('./executor');
 const { classifyManagement } = require('./manage');
 const { applyManagement } = require('./position-manager');
-const { addPosition, listPositions } = require('./positions');
+const { addPosition, listPositions, saveLastSignal, loadLastSignal } = require('./positions');
 
 const SESSION_DIR = path.join(__dirname, '..', '.runtime', 'sessions');
 const TP_WINDOW_MS = Number(process.env.TRADE_TP_WINDOW_MS || 5 * 60 * 1000);
@@ -264,7 +264,7 @@ async function onMessage(msg) {
   const isChannelMsg = isChannel(jid);
   const isGroup = jid.endsWith('@g.us');
   const isDM = jid.endsWith('@s.whatsapp.net');
-  const isCommand = /^\/(status|help|positions)$/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|retake|retry)$/i.test(text.trim());
 
   // commands: allowed senders, anywhere
   if (isCommand && senderAllowed(sender)) {
@@ -347,6 +347,9 @@ async function handleIncoming(sender, text) {
 }
 
 async function handleTrade(sig) {
+  // remember the signal so a missed/failed trade can be retaken with /retake
+  if (sig && sig.pair) saveLastSignal(sig);
+
   const verdict = validateSignal(sig);
   if (!verdict.ok) return `⛔ Rejected: ${verdict.problems.join('; ')}`;
 
@@ -398,10 +401,23 @@ async function handleCommand(cmd) {
       `${i + 1}. ${p.side} ${p.pair} ${p.lot} lot @ ${p.entry ?? '?'} | SL ${p.sl ?? '-'} | TP ${p.tp ?? '-'} | opened ${new Date(p.openedAt).toLocaleTimeString()}`,
     ).join('\n');
   }
+  if (cmd === '/retake' || cmd === '/retry') {
+    const last = loadLastSignal();
+    if (!last) return 'ℹ️ No recent signal stored. Wait for the next signal from the channel.';
+    const zone = last.entryLow != null && last.entryHigh != null && last.entryLow !== last.entryHigh
+      ? `${last.entryLow}-${last.entryHigh}`
+      : (last.entry != null ? String(last.entry) : 'market');
+    const msg = `🔁 Retaking last signal: ${last.action} ${last.pair} zone ${zone} | SL ${last.sl}` +
+      (last.tp != null ? ` | TP ${last.tp}` : '');
+    // acknowledge, then attempt execution
+    const result = await handleTrade(last);
+    return `${msg}\n${result}`;
+  }
   return [
     '🤖 exness-signal-bot — commands:',
     '/status — bot status',
     '/positions — tracked open positions',
+    '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
     'Signals are only read from the configured channel + provider.',
   ].join('\n');
 }
