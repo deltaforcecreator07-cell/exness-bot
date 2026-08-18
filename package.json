@@ -11,13 +11,14 @@
     "start": "node src/index.js",
     "dump-dom": "node src/dump-dom.js",
     "test": "node tests/parser-test.js && node tests/manage-test.js && node tests/config-test.js",
-    "test:wa": "node tests/wa-connect-test.js"
+    "test:wa": "node tests/wa-connect-test.js",
+    "postinstall": "puppeteer browsers install chrome-headless-shell"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "dotenv": "^16.4.5",
     "pino": "^9.5.0",
-    "puppeteer": "^23.11.1",
+    "puppeteer": "^25.8.0",
     "qrcode-terminal": "^0.12.0"
   }
 }
