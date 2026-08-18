@@ -264,11 +264,11 @@ async function onMessage(msg) {
   const isChannelMsg = isChannel(jid);
   const isGroup = jid.endsWith('@g.us');
   const isDM = jid.endsWith('@s.whatsapp.net');
-  const isCommand = /^\/(status|help|positions|retake|retry)$/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|retake|retry|trade)\b/i.test(text.trim());
 
   // commands: allowed senders, anywhere
   if (isCommand && senderAllowed(sender)) {
-    const reply = await handleCommand(text.trim().toLowerCase());
+    const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
     return;
   }
@@ -378,8 +378,25 @@ async function handleTrade(sig) {
     (result.confirmed ? ' — order confirmed ✔' : ' — check terminal for confirmation');
 }
 
-async function handleCommand(cmd) {
+async function handleCommand(rawCmd, sender) {
+  const cmd = rawCmd.toLowerCase().trim();
   const s = todayStats();
+
+  // /trade <signal> — manually enter a trade, e.g.
+  //   /trade SELL XAUUSD 4392-94 SL 4400 TP 4384
+  // Only the owner (ALLOWED_SENDERS) can do this; goes through the same
+  // risk sizing + safety checks as a channel signal.
+  if (cmd.startsWith('/trade ')) {
+    const signalText = rawCmd.replace(/^\/trade\s+/i, '').trim();
+    if (!signalText) return 'Usage: /trade BUY|SELL PAIR ZONE SL <price> TP <price>\nExample: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
+    const parsed = parseTradeMessage(signalText);
+    if (!parsed) return '❌ Could not parse that as a trade.\nUse: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
+    const sig = { ...parsed, tp: parsed.tp && parsed.tp.length ? parsed.tp[0] : null, tps: parsed.tp };
+    if (sig.sl == null) return '❌ No SL found — a stop loss is required.';
+    console.log(`[trade-cmd] owner manual trade from ${sender}: ${signalText}`);
+    return await handleTrade(sig);
+  }
+
   if (cmd === '/status') {
     const ps = listPositions();
     return [
@@ -418,6 +435,7 @@ async function handleCommand(cmd) {
     '/status — bot status',
     '/positions — tracked open positions',
     '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
+    '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manually enter a trade (owner only)',
     'Signals are only read from the configured channel + provider.',
   ].join('\n');
 }
