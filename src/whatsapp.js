@@ -81,7 +81,7 @@ async function resolveConfiguredChannels() {
     try {
       const meta = await sock.newsletterMetadata('invite', code);
       if (meta && meta.id) {
-        console.log(`[whatsapp] resolved channel invite "${code}" -> ${meta.id} (${meta.name || '?'})`);
+        console.log(`[whatsapp] resolved channel invite "${code}" -> ${meta.id} (${channelNameFromMeta(meta) || '?'})`);
         out.push(meta.id);
       } else {
         console.warn(`[whatsapp] invite "${code}" resolved to nothing — keeping as-is`);
