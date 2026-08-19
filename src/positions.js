@@ -66,29 +66,50 @@ function closeTracked(pair) {
 function listPositions() { return load(); }
 function latestPosition() { const l = load(); return l.length ? l[l.length - 1] : null; }
 
-/* ---------------- last-signal memory (for /retake) ---------------- */
+/* ---------------- last-signal memory (auto-retry + /retake) ---------------- */
 
 const LAST_SIGNAL_FILE = path.join(STATE_DIR, 'last-signal.json');
 
-/** Remember the most recent trade signal, so a missed trade can be retaken. */
+/**
+ * Remember the most recent trade signal.
+ * executed=true means it was already traded (or permanently rejected) — the
+ * bot will NOT auto-retry it. executed=false (fresh or failed) = the bot
+ * auto-retries it on the next startup/connect, so a crash or OOM never loses
+ * a trade.
+ */
 function saveLastSignal(sig) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(LAST_SIGNAL_FILE, JSON.stringify({ sig, at: Date.now() }));
+    fs.writeFileSync(LAST_SIGNAL_FILE, JSON.stringify({ sig, executed: false, at: Date.now() }));
   } catch (e) { console.warn('[positions] saveLastSignal failed:', e.message); }
 }
 
-/** Load the last signal (null if none / expired). */
-function loadLastSignal(maxAgeMs = 24 * 60 * 60 * 1000) {
+/** Mark the last signal as executed so it is NOT auto-retried. */
+function markLastSignalExecuted() {
+  try {
+    const d = JSON.parse(fs.readFileSync(LAST_SIGNAL_FILE, 'utf8'));
+    d.executed = true;
+    fs.writeFileSync(LAST_SIGNAL_FILE, JSON.stringify(d));
+  } catch (e) { /* no file — ignore */ }
+}
+
+/** Load the full record { sig, executed, at } (null if none / expired). */
+function loadLastSignalRecord(maxAgeMs = 24 * 60 * 60 * 1000) {
   try {
     const d = JSON.parse(fs.readFileSync(LAST_SIGNAL_FILE, 'utf8'));
     if (!d || !d.sig) return null;
     if (Date.now() - (d.at || 0) > maxAgeMs) return null;
-    return d.sig;
+    return d;
   } catch { return null; }
+}
+
+/** Load just the signal (null if none / expired / already executed). */
+function loadLastSignal(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const rec = loadLastSignalRecord(maxAgeMs);
+  return rec ? rec.sig : null;
 }
 
 module.exports = {
   addPosition, updatePosition, closeTracked, listPositions, latestPosition,
-  saveLastSignal, loadLastSignal,
+  saveLastSignal, loadLastSignal, loadLastSignalRecord, markLastSignalExecuted,
 };
