@@ -150,6 +150,32 @@ async function clearAndType(page, elHandleOrSelector, text) {
 
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+/**
+ * Memory guard for Render free (512 MB limit).
+ * Node + Baileys already use ~140 MB; launching chrome-headless-shell + the
+ * heavy trading-terminal page can push past 512 MB and trigger an OOM restart
+ * (which also wipes the WhatsApp session). Refuse to launch when we're already
+ * too close to the limit, and use every memory-saving flag we can.
+ */
+function memoryTooHigh() {
+  const rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+  const limit = Number(process.env.MAX_RSS_MB || 380);
+  const tooHigh = rssMB > limit;
+  if (tooHigh) console.warn(`[exness] MEMORY GUARD: rss=${rssMB}MB > ${limit}MB — skipping browser launch to avoid OOM`);
+  return tooHigh;
+}
+
+/** Delete old screenshots (they accumulate on the ephemeral disk). */
+function cleanupScreenshots(keep = 12) {
+  try {
+    const files = fs.readdirSync(SHOT_DIR).filter(f => f.endsWith('.png')).sort();
+    while (files.length > keep) {
+      const oldest = files.shift();
+      fs.unlinkSync(path.join(SHOT_DIR, oldest));
+    }
+  } catch (e) { /* ignore */ }
+}
+
 async function launchBrowser() {
   const puppeteer = require('puppeteer'); // lazy require
   const args = [
@@ -157,12 +183,18 @@ async function launchBrowser() {
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
     '--disable-gpu',
+    '--disable-software-rasterizer',
     '--disable-extensions',
-    '--no-zygote',
     '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-renderer-backgrounding',
+    '--no-zygote',
     '--mute-audio',
     '--disable-blink-features=AutomationControlled', // hides automation from the app
+    '--js-flags=--max-old-space-size=256', // cap V8 heap inside the browser
   ];
+  // Optional: --single-process saves RAM but is less stable — opt in via env.
+  if (process.env.PUPPETEER_SINGLE_PROCESS === '1') args.push('--single-process');
   // IMPORTANT (Render free = 512 MB disk): only chrome-headless-shell is
   // installed (see package.json postinstall). Full Chrome (~340 MB) does not
   // fit alongside node_modules, so we NEVER fall back to it.
@@ -538,6 +570,21 @@ async function placeOrder(page, sig) {
 
 async function executeTrade(signal, timeoutMs = 180000) {
   if (busy) throw new Error('another execution is already in progress');
+  cleanupScreenshots();
+
+  // OOM guard that WAITS instead of failing: if memory is high (usually because
+  // a previous browser is still releasing), poll until it frees (up to 2 min).
+  // This keeps the bot fully automatic — it never silently skips a trade.
+  const memoryWaitMs = Number(process.env.MEMORY_WAIT_MS || 120000);
+  const memoryWaitStart = Date.now();
+  while (memoryTooHigh()) {
+    if (Date.now() - memoryWaitStart > memoryWaitMs) {
+      throw new Error(`Memory guard: RSS stayed above ${process.env.MAX_RSS_MB || 380}MB for ${memoryWaitMs / 1000}s — skipping to avoid OOM. The signal is saved and will be auto-retried on the next restart/connect.`);
+    }
+    console.log(`[exness] memory still high (${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB), waiting 10s before retrying...`);
+    await sleep(10000);
+  }
+
   busy = true;
 
   const run = (async () => {
