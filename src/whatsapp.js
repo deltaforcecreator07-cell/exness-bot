@@ -37,7 +37,8 @@ const { senderAllowed, isProvider, validateSignal, markExecuted, todayStats } = 
 const { execute } = require('./executor');
 const { classifyManagement } = require('./manage');
 const { applyManagement } = require('./position-manager');
-const { addPosition, listPositions, saveLastSignal, loadLastSignal } = require('./positions');
+const { addPosition, listPositions, saveLastSignal, loadLastSignal, loadLastSignalRecord, markLastSignalExecuted } = require('./positions');
+const { currentMode, setMode } = require('./runtime-mode');
 
 const SESSION_DIR = path.join(__dirname, '..', '.runtime', 'sessions');
 const TP_WINDOW_MS = Number(process.env.TRADE_TP_WINDOW_MS || 5 * 60 * 1000);
@@ -130,6 +131,9 @@ async function startWhatsApp() {
     if (connection === 'open') {
       console.log('[whatsapp] connected as', sock.user?.id);
       await subscribeToChannels();
+      // FULL AUTOMATION: if a previous attempt failed/crashed (OOM, login
+      // issue) and the signal is still fresh + not executed, auto-retry it.
+      await autoRetryPending();
     }
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
@@ -261,11 +265,15 @@ async function onMessage(msg) {
 
   const sender = msg.key.participant || jid;
 
+  // DEBUG: log EVERY incoming message so you can see in Render logs whether
+  // the bot receives your DMs / channel signals at all.
+  console.log(`[whatsapp:debug] jid=${jid} fromMe=${!!msg.key.fromMe} sender=${sender} txt=${text.slice(0, 80).replace(/\n/g, ' | ')}`);
+
   // Commands (/trade, /retake, /status, ...) are handled FIRST — before the
   // fromMe filter — so the owner can DM commands to their own number (self-DM)
   // and they still work. (When you message yourself, fromMe is true because
   // the message comes from the bot's own linked account.)
-  const isCommand = /^\/(status|help|positions|retake|retry|trade)\b/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode)\b/i.test(text.trim());
   if (isCommand && senderAllowed(sender)) {
     const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
@@ -351,21 +359,48 @@ async function handleIncoming(sender, text) {
   return null; // noise — stay silent
 }
 
+/**
+ * FULL AUTOMATION: on every WhatsApp connect (including after an OOM restart),
+ * check whether there is a saved signal that was never executed. If so, fire it
+ * automatically. The duplicate-protection in the risk layer prevents a second
+ * entry if it was actually already placed.
+ */
+async function autoRetryPending() {
+  try {
+    const rec = loadLastSignalRecord();
+    if (!rec) return;
+    if (rec.executed) return; // already handled
+    console.log('[auto-retry] found unexecuted signal, retrying automatically...');
+    const reply = await handleTrade(rec.sig);
+    console.log('[auto-retry] result:', reply);
+  } catch (e) {
+    console.error('[auto-retry] failed:', e.message);
+  }
+}
+
 async function handleTrade(sig) {
-  // remember the signal so a missed/failed trade can be retaken with /retake
+  // remember the signal so a missed/failed trade is never lost
+  // (auto-retried on next connect, or retaken with /retake)
   if (sig && sig.pair) saveLastSignal(sig);
 
   const verdict = validateSignal(sig);
-  if (!verdict.ok) return `⛔ Rejected: ${verdict.problems.join('; ')}`;
+  if (!verdict.ok) {
+    // permanent rejection (invalid SL side, duplicate, caps) — don't retry forever
+    markLastSignalExecuted();
+    return `⛔ Rejected: ${verdict.problems.join('; ')}`;
+  }
 
   let result;
   try {
     result = await execute(sig);
   } catch (e) {
+    // transient failure (OOM guard, login hiccup) — KEEP pending so the bot
+    // auto-retries on next connect; also available via /retake
     return `❌ Execution failed: ${e.message}`;
   }
 
   markExecuted(sig); // count only after success
+  markLastSignalExecuted(); // success → don't auto-retry again
 
   const zone = sig.entryLow != null && sig.entryHigh != null && sig.entryLow !== sig.entryHigh
     ? `${sig.entryLow}-${sig.entryHigh}`
@@ -402,11 +437,19 @@ async function handleCommand(rawCmd, sender) {
     return await handleTrade(sig);
   }
 
+  // /mode [log|puppeteer] — switch execution mode instantly without restart
+  if (cmd === '/mode' || cmd.startsWith('/mode ')) {
+    const arg = rawCmd.replace(/^\/mode\s*/i, '').trim().toLowerCase();
+    if (!arg) return `Current mode: ${currentMode()}\nUsage: /mode log | /mode puppeteer\n(log = dry-run, puppeteer = real trade)`;
+    const r = setMode(arg);
+    return r.message + ` (now: ${currentMode()})`;
+  }
+
   if (cmd === '/status') {
     const ps = listPositions();
     return [
       '🤖 exness-signal-bot',
-      `mode: ${process.env.EXECUTION_MODE || 'puppeteer'}`,
+      `mode: ${currentMode()}`,
       `llm: ${process.env.GEMINI_API_KEY ? 'gemini ✔' : 'rules only'}`,
       `channel: ${process.env.ALLOWED_CHANNELS || '(none)'}`,
       `group: ${process.env.ALLOWED_GROUPS || '(none)'}`,
@@ -437,7 +480,8 @@ async function handleCommand(rawCmd, sender) {
   }
   return [
     '🤖 exness-signal-bot — commands:',
-    '/status — bot status',
+    '/status — bot status (shows current mode)',
+    '/mode [log|puppeteer] — switch dry-run ↔ real trading instantly (no restart)',
     '/positions — tracked open positions',
     '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
     '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manually enter a trade (owner only)',
