@@ -112,16 +112,20 @@ async function isTerminalVisible(page) {
   });
 }
 
-/** Real mouse click on a visible element whose exact text matches (case-insensitive). */
+/** Real mouse click on a visible element whose text matches one of the wanted labels (case-insensitive). */
 async function clickVisibleText(page, wanted, timeout = 8000) {
+  const wantedArr = (Array.isArray(wanted) ? wanted : [wanted]).map(String);
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const handle = await page.evaluateHandle((w) => {
+    const handle = await page.evaluateHandle((list) => {
       const el = [...document.querySelectorAll('span, div, td, a, label, button')]
         .filter((e) => e.offsetParent !== null && e.childElementCount === 0)
-        .find((e) => (e.innerText || '').trim().toLowerCase() === w.toLowerCase());
+        .find((e) => {
+          const txt = (e.innerText || '').trim().toLowerCase();
+          return list.some((w) => txt === w.toLowerCase() || txt.startsWith(w.toLowerCase() + ' '));
+        });
       return el || null;
-    }, wanted);
+    }, wantedArr);
     const el = handle.asElement();
     if (el) {
       await el.click({ delay: 40 }).catch(() => {});
@@ -130,7 +134,7 @@ async function clickVisibleText(page, wanted, timeout = 8000) {
     }
     await sleep(700);
   }
-  throw new Error(`clickVisibleText: "${wanted}" not found in ${timeout}ms`);
+  throw new Error(`clickVisibleText: "${wantedArr.join(' | ')}" not found in ${timeout}ms`);
 }
 
 /** Focus an input, select all its content, then type real keystrokes. */
@@ -516,14 +520,16 @@ async function loginPage() {
 
 /* ---------------- order placement ---------------- */
 
-/** Find a GWT form field by its label text (label cell + adjacent input). */
+/** Find a GWT form field by its label text (label cell + adjacent input).
+ *  Tolerant: matches "Volume:", "Volume (lots):", "Stop Loss", etc. */
 async function fieldForLabel(page, label) {
   return page.evaluateHandle((needle) => {
-    const cells = [...document.querySelectorAll('td, div, span')]
+    const n = needle.toLowerCase();
+    const cells = [...document.querySelectorAll('td, div, span, label')]
       .filter((c) => c.offsetParent !== null && c.childElementCount === 0);
     const cell = cells.find((c) => {
       const t = (c.innerText || '').trim().toLowerCase();
-      return t === needle.toLowerCase() || t.startsWith(needle.toLowerCase() + ':');
+      return t === n || t.startsWith(n + ':') || t.startsWith(n + ' (') || t === n + ':';
     });
     if (!cell) return null;
     // input in the same row (td) or the next sibling container
@@ -534,14 +540,46 @@ async function fieldForLabel(page, label) {
   }, label);
 }
 
+/** Is the order ticket dialog open? (has Volume / Stop Loss / Take Profit fields) */
+async function isOrderTicketOpen(page) {
+  return page.evaluate(() => {
+    const m = [...document.querySelectorAll('.page-window.modal')]
+      .find(x => !/hidden/.test(x.className || ''));
+    if (!m) return false;
+    const t = (m.innerText || '');
+    return /Volume|Stop Loss|Take Profit|Stop loss/i.test(t);
+  });
+}
+
 /**
- * Open the order ticket for a symbol the way a human would:
- * 1) double-click the symbol row in Market Watch (authentic GWT behavior)
- * 2) fallback: F9 (New Order shortcut)
- * 3) fallback: a "New Order" button/link
+ * Open the order ticket for a symbol:
+ * 1) F9 (New Order shortcut)
+ * 2) if the ticket has no Volume field, find the symbol in Market Watch:
+ *    open the Market Watch search, type the pair, double-click it (opens the
+ *    ticket for THAT symbol)
+ * 3) fallback: "New Order" toolbar button
  */
 async function openOrderTicket(page, pair) {
-  const dbl = await page.evaluate((sym) => {
+  // try 1: F9
+  await page.keyboard.press('F9').catch(() => {});
+  await sleep(2500);
+  if (await isOrderTicketOpen(page)) {
+    console.log('[exness] order ticket opened (F9)');
+    return;
+  }
+
+  // try 2: search the symbol in Market Watch and double-click it
+  const found = await page.evaluate((sym) => {
+    // open Market Watch search box if present
+    const search = [...document.querySelectorAll('input')]
+      .find(i => i.offsetParent !== null && /search|symbol/i.test((i.placeholder || '') + (i.name || '')));
+    if (search) {
+      search.focus();
+      const proto = window.HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(search, sym);
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    // find the symbol row and double-click it
     const el = [...document.querySelectorAll('td, span, div, tr')]
       .filter((e) => e.offsetParent !== null && e.childElementCount === 0)
       .find((e) => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
@@ -551,12 +589,16 @@ async function openOrderTicket(page, pair) {
     }
     return false;
   }, pair);
-  if (dbl) { await sleep(2500); return; }
+  if (found) {
+    await sleep(2500);
+    if (await isOrderTicketOpen(page)) {
+      console.log('[exness] order ticket opened (symbol dblclick)');
+      return;
+    }
+  }
 
-  await page.keyboard.press('F9').catch(() => {});
-  await sleep(2500);
-  await clickVisibleText(page, 'New Order', 3000).catch(async () => {
-    // toolbar icon buttons often carry a title attribute instead of text
+  // try 3: New Order button/menu
+  await clickVisibleText(page, ['New Order', 'New Order...'], 3000).catch(async () => {
     await page.evaluate(() => {
       const el = [...document.querySelectorAll('button, [role="button"], div, span')]
         .find((b) => b.offsetParent !== null && /New Order/i.test(b.title || ''));
@@ -564,6 +606,12 @@ async function openOrderTicket(page, pair) {
     });
   });
   await sleep(2000);
+  if (await isOrderTicketOpen(page)) {
+    console.log('[exness] order ticket opened (New Order)');
+    return;
+  }
+  await screenshot(page, 'no-order-ticket');
+  throw new Error('Could not open the order ticket (F9 / symbol search / New Order all failed). See screenshot.');
 }
 
 async function placeOrder(page, sig) {
@@ -572,20 +620,44 @@ async function placeOrder(page, sig) {
   // 0) sanity: if the login dialog is somehow still open, stop
   if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
 
-  // 1) open the order ticket (dblclick symbol in Market Watch, else F9, else New Order button)
+  // 1) open the order ticket
   await openOrderTicket(page, pair);
   await screenshot(page, 'order-ticket');
 
-  // 2) symbol: if there is a symbol search box, use it as extra safety
-  const searchBox = await page.$('input[placeholder*="ymbol"], input[placeholder*="earch"]');
-  if (searchBox) {
-    await clearAndType(page, searchBox, pair);
-    await page.keyboard.press('Enter');
-    await sleep(2000);
-    console.log('[exness] symbol set to', pair);
+  // 2) set the SYMBOL inside the ticket (F9 opens on the chart's current
+  //    symbol, which may be a different pair). Look for a symbol field /
+  //    combo inside the order dialog and set it.
+  const symbolSet = await page.evaluate((sym) => {
+    const m = [...document.querySelectorAll('.page-window.modal')]
+      .find(x => !/hidden/.test(x.className || ''));
+    if (!m) return false;
+    // symbol input: id/name/placeholder containing symbol, or input near a
+    // "Symbol:" label inside the dialog
+    let input = [...m.querySelectorAll('input')]
+      .find(i => /symbol/i.test((i.id || '') + (i.name || '') + (i.placeholder || '')));
+    if (!input) {
+      const label = [...m.querySelectorAll('td, div, span, label')]
+        .find(c => c.offsetParent !== null && c.childElementCount === 0 && /^Symbol:?$/i.test((c.innerText || '').trim()));
+      if (label) {
+        const row = label.closest('tr') || label.parentElement;
+        input = row ? row.querySelector('input') : null;
+      }
+    }
+    if (!input) return false;
+    const proto = window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, sym);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, pair);
+  if (symbolSet) {
+    console.log('[exness] symbol set in ticket to', pair);
+    await sleep(1500);
+  } else {
+    console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
   }
 
-  // 3) volume / SL / TP by label
+  // 3) volume / SL / TP by label (tolerant matching)
   const volumeField = await fieldForLabel(page, 'Volume');
   if (volumeField.asElement()) {
     await clearAndType(page, volumeField.asElement(), String(lot));
