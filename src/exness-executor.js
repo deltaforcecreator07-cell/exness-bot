@@ -552,66 +552,121 @@ async function isOrderTicketOpen(page) {
 }
 
 /**
- * Open the order ticket for a symbol:
- * 1) F9 (New Order shortcut)
- * 2) if the ticket has no Volume field, find the symbol in Market Watch:
- *    open the Market Watch search, type the pair, double-click it (opens the
- *    ticket for THAT symbol)
- * 3) fallback: "New Order" toolbar button
+ * Open the order ticket for a symbol. GWT needs REAL mouse events, so we use
+ * page.mouse (coordinate clicks), not synthetic dispatchEvent.
+ *  1) click the chart to focus the terminal, then F9
+ *  2) Market Watch search: click the search box, type the symbol, double-click
+ *     the filtered row (opens the ticket for that symbol)
+ *  3) toolbar "New Order" button
+ *  4) right-click a Market Watch row -> "New Order" context menu
+ * If all fail, dumps the terminal UI so we can adapt.
  */
 async function openOrderTicket(page, pair) {
-  // try 1: F9
-  await page.keyboard.press('F9').catch(() => {});
-  await sleep(2500);
-  if (await isOrderTicketOpen(page)) {
-    console.log('[exness] order ticket opened (F9)');
-    return;
-  }
-
-  // try 2: search the symbol in Market Watch and double-click it
-  const found = await page.evaluate((sym) => {
-    // open Market Watch search box if present
-    const search = [...document.querySelectorAll('input')]
-      .find(i => i.offsetParent !== null && /search|symbol/i.test((i.placeholder || '') + (i.name || '')));
-    if (search) {
-      search.focus();
-      const proto = window.HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, 'value').set.call(search, sym);
-      search.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    // find the symbol row and double-click it
-    const el = [...document.querySelectorAll('td, span, div, tr')]
-      .filter((e) => e.offsetParent !== null && e.childElementCount === 0)
-      .find((e) => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
-    if (el) {
-      el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
-      return true;
+  const tryWaitTicket = async (how) => {
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      if (await isOrderTicketOpen(page)) { console.log(`[exness] order ticket opened (${how})`); return true; }
+      await sleep(1000);
     }
     return false;
-  }, pair);
-  if (found) {
-    await sleep(2500);
-    if (await isOrderTicketOpen(page)) {
-      console.log('[exness] order ticket opened (symbol dblclick)');
-      return;
+  };
+
+  // focus the terminal by clicking the chart area
+  try {
+    const cb = await page.evaluate(() => {
+      const c = document.querySelector('canvas');
+      if (!c) return null;
+      const r = c.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (cb) await page.mouse.click(cb.x, cb.y);
+  } catch {}
+  await sleep(600);
+
+  // 1) F9
+  await page.keyboard.press('F9').catch(() => {});
+  if (await tryWaitTicket('F9')) return;
+
+  // 2) Market Watch search + double-click symbol (real mouse)
+  const searchBox = await page.evaluate(() => {
+    const inputs = [...document.querySelectorAll('input')].filter(i => i.offsetParent !== null);
+    return inputs.find(i => /search|symbol/i.test((i.placeholder || '') + (i.name || '') + (i.id || ''))) || null;
+  });
+  if (searchBox) {
+    const sb = await searchBox.boundingBox();
+    if (sb) {
+      await page.mouse.click(sb.x + sb.width / 2, sb.y + sb.height / 2);
+      await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+      await page.keyboard.type(pair, { delay: 60 });
+      await sleep(1800);
+      const rowBox = await page.evaluate((sym) => {
+        const el = [...document.querySelectorAll('td, span, div, tr')]
+          .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+          .find(e => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }, pair);
+      if (rowBox) {
+        await page.mouse.click(rowBox.x, rowBox.y, { clickCount: 2 });
+        if (await tryWaitTicket('market watch dblclick')) return;
+      }
     }
   }
 
-  // try 3: New Order button/menu
-  await clickVisibleText(page, ['New Order', 'New Order...'], 3000).catch(async () => {
-    await page.evaluate(() => {
-      const el = [...document.querySelectorAll('button, [role="button"], div, span')]
-        .find((b) => b.offsetParent !== null && /New Order/i.test(b.title || ''));
-      if (el) el.click();
-    });
+  // 3) toolbar "New Order" button (title/aria-label/class)
+  const btnBox = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('button, [role="button"], a, div, span')]
+      .find(b => b.offsetParent !== null && /New Order/i.test((b.title || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.className || '')));
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
-  await sleep(2000);
-  if (await isOrderTicketOpen(page)) {
-    console.log('[exness] order ticket opened (New Order)');
-    return;
+  if (btnBox) {
+    await page.mouse.click(btnBox.x, btnBox.y);
+    if (await tryWaitTicket('toolbar button')) return;
   }
+
+  // 4) right-click a Market Watch row -> New Order
+  const anyRowBox = await page.evaluate(() => {
+    const el = [...document.querySelectorAll('td, span, div, tr')]
+      .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+      .find(e => /^[A-Z]{3,6}$/.test((e.innerText || '').trim()));
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (anyRowBox) {
+    await page.mouse.click(anyRowBox.x, anyRowBox.y, { button: 'right' });
+    await sleep(1200);
+    const ctxBox = await page.evaluate(() => {
+      const el = [...document.querySelectorAll('div, span, td, li, button')]
+        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+        .find(e => /^New Order/i.test((e.innerText || '').trim()));
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (ctxBox) {
+      await page.mouse.click(ctxBox.x, ctxBox.y);
+      if (await tryWaitTicket('context menu')) return;
+    }
+  }
+
+  // diagnostic dump so we can adapt next iteration
+  const dump = await page.evaluate(() => ({
+    toolbar: [...document.querySelectorAll('button, [role="button"], [title]')]
+      .filter(b => b.offsetParent !== null)
+      .map(b => ({ t: (b.innerText || b.title || b.getAttribute('aria-label') || '').trim().slice(0, 40), ti: (b.title || '').slice(0, 40), c: (b.className || '').toString().slice(0, 30) }))
+      .filter(x => x.t || x.ti)
+      .slice(0, 30),
+    menus: [...document.querySelectorAll('.page-menu .item .label')].map(l => (l.innerText || '').trim()).filter(Boolean).slice(0, 25),
+    hasMarketWatch: /Market Watch/i.test(document.body ? document.body.innerText : ''),
+    inputs: [...document.querySelectorAll('input')].filter(i => i.offsetParent !== null).map(i => ({ ph: i.placeholder, id: i.id, cls: (i.className || '').toString().slice(0, 20) })),
+  }));
+  console.log('[exness] terminal dump (no ticket):', JSON.stringify(dump));
   await screenshot(page, 'no-order-ticket');
-  throw new Error('Could not open the order ticket (F9 / symbol search / New Order all failed). See screenshot.');
+  throw new Error('Could not open the order ticket (F9 / market watch / toolbar / context all failed). See screenshot + terminal dump.');
 }
 
 async function placeOrder(page, sig) {
