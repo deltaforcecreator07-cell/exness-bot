@@ -544,14 +544,17 @@ async function fieldForLabel(page, label) {
   }, label);
 }
 
-/** Is the order ticket dialog open? (has Volume / Stop Loss / Take Profit fields) */
+/** Is the order ticket open? Look for its fields (volume/sl/tp) anywhere, not
+ *  just in the first visible modal (the symbol dropdown is also a modal). */
 async function isOrderTicketOpen(page) {
   return page.evaluate(() => {
-    const m = [...document.querySelectorAll('.page-window.modal')]
-      .find(x => !/hidden/.test(x.className || ''));
+    const vis = (el) => el.offsetParent !== null;
+    const ids = [...document.querySelectorAll('input')].filter(vis).map(i => (i.id || '').toLowerCase());
+    if (ids.includes('volume') && (ids.includes('sl') || ids.includes('tp'))) return true;
+    const m = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
     if (!m) return false;
     const t = (m.innerText || '');
-    return /Volume|Stop Loss|Take Profit|Stop loss/i.test(t);
+    return /Volume|Stop Loss|Take Profit/i.test(t);
   });
 }
 
@@ -683,20 +686,18 @@ async function placeOrder(page, sig) {
   await openOrderTicket(page, pair);
   await screenshot(page, 'order-ticket');
 
-  // 2) set the SYMBOL inside the ticket (F9 opens on the chart's current
-  //    symbol, which may be a different pair). Look for a symbol field /
-  //    combo inside the order dialog and set it.
+  // 2) set the SYMBOL inside the ticket. The symbol field is a combo: set the
+  //    value, then CLICK the matching option in the dropdown to commit it
+  //    (otherwise the dropdown stays open and the ticket isn't submittable).
   const symbolSet = await page.evaluate((sym) => {
-    const m = [...document.querySelectorAll('.page-window.modal')]
-      .find(x => !/hidden/.test(x.className || ''));
-    if (!m) return false;
-    // symbol input: id/name/placeholder containing symbol, or input near a
-    // "Symbol:" label inside the dialog
-    let input = [...m.querySelectorAll('input')]
+    const vis = (el) => el.offsetParent !== null;
+    // find the symbol input anywhere (id/name/placeholder containing symbol)
+    let input = [...document.querySelectorAll('input')]
+      .filter(vis)
       .find(i => /symbol/i.test((i.id || '') + (i.name || '') + (i.placeholder || '')));
     if (!input) {
-      const label = [...m.querySelectorAll('td, div, span, label')]
-        .find(c => c.offsetParent !== null && c.childElementCount === 0 && /^Symbol:?$/i.test((c.innerText || '').trim()));
+      const label = [...document.querySelectorAll('td, div, span, label')]
+        .find(c => vis(c) && c.childElementCount === 0 && /^Symbol:?$/i.test((c.innerText || '').trim()));
       if (label) {
         const row = label.closest('tr') || label.parentElement;
         input = row ? row.querySelector('input') : null;
@@ -710,7 +711,23 @@ async function placeOrder(page, sig) {
     return true;
   }, pair);
   if (symbolSet) {
-    console.log('[exness] symbol set in ticket to', pair);
+    console.log('[exness] symbol value set, committing by clicking the option...');
+    // click the exact symbol option in the dropdown (real mouse)
+    const optBox = await page.evaluate((sym) => {
+      const el = [...document.querySelectorAll('.option, .datalist .option, td, div, span')]
+        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+        .find(e => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }, pair);
+    if (optBox) {
+      await page.mouse.click(optBox.x, optBox.y);
+      console.log('[exness] symbol option clicked:', pair);
+    } else {
+      await page.keyboard.press('Enter');
+      console.log('[exness] no option found, pressed Enter');
+    }
     await sleep(1500);
   } else {
     console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
@@ -735,33 +752,42 @@ async function placeOrder(page, sig) {
   }
   await sleep(1000);
 
-  // 4) verify the ticket is submittable BEFORE clicking (volume must be set,
-  //    and the Buy/Sell button must not be disabled) — prevents silent no-ops
+  // 4) verify the ticket is submittable BEFORE clicking. The Buy/Sell buttons
+  //    are found document-wide (the visible modal may be the symbol dropdown).
   const ticketOk = await page.evaluate((act) => {
-    const m = [...document.querySelectorAll('.page-window.modal')]
-      .find(x => !/hidden/.test(x.className || ''));
-    if (!m) return { ok: false, why: 'no visible order dialog' };
-    const btn = [...m.querySelectorAll('button')]
-      .find(b => b.offsetParent !== null && new RegExp('^' + act + '$', 'i').test((b.innerText || '').trim()));
-    const inputs = [...m.querySelectorAll('input')].filter(i => i.offsetParent !== null);
-    const volumeInput = inputs.find(i => /volume|lots/i.test((i.id || '') + (i.name || '') + (i.placeholder || '')))
-      || [...m.querySelectorAll('input')].find((i, idx, arr) => {
-        // fallback: the 3rd+ input region near "Volume" label
-        return false;
+    const vis = (el) => el.offsetParent !== null;
+    const btn = [...document.querySelectorAll('button, [role="button"], div, span')]
+      .filter(vis)
+      .find(b => {
+        const t = (b.innerText || '').trim();
+        return t && new RegExp('^' + act + '(:|$)', 'i').test(t) && b.children.length <= 2;
       });
+    const inputs = [...document.querySelectorAll('input')].filter(vis);
+    const ids = inputs.map(i => (i.id || '').toLowerCase());
     return {
       ok: !!btn && !btn.disabled,
       btnFound: !!btn,
+      btnText: btn ? (btn.innerText || '').trim().slice(0, 30) : null,
       btnDisabled: btn ? btn.disabled : null,
-      inputCount: inputs.length,
-      inputIds: inputs.map(i => i.id || i.name || i.placeholder).slice(0, 8),
-      bodySnippet: (m.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
+      hasVolume: ids.includes('volume'),
+      hasSlTp: ids.includes('sl') && ids.includes('tp'),
+      inputIds: ids.slice(0, 10),
     };
   }, action);
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
-  if (!ticketOk.ok) {
+  if (!ticketOk.ok || !ticketOk.hasVolume) {
+    // dump all buttons in the ticket area so we can adapt
+    const dump = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      return [...document.querySelectorAll('button, [role="button"], .input-button, div[class*="btn" i]')]
+        .filter(vis)
+        .map(b => ({ t: (b.innerText || '').trim().slice(0, 24), id: b.id, c: (b.className || '').toString().slice(0, 24) }))
+        .filter(x => x.t || x.id || x.c)
+        .slice(0, 25);
+    });
+    console.log('[exness] all ticket buttons:', JSON.stringify(dump));
     await screenshot(page, 'ticket-not-submittable');
-    throw new Error(`Order ticket not submittable: ${ticketOk.why || ('button ' + (ticketOk.btnFound ? (ticketOk.btnDisabled ? 'disabled' : '?') : 'missing') + ' — see screenshot')}`);
+    throw new Error(`Order ticket not submittable: ${ticketOk.why || ('btn=' + ticketOk.btnFound + ' volume=' + ticketOk.hasVolume + ' — see screenshot + button dump')}`);
   }
 
   // 5) Buy / Sell (real mouse click — GWT needs it)
