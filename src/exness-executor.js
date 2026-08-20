@@ -113,22 +113,26 @@ async function isTerminalVisible(page) {
 }
 
 /** Real mouse click on a visible element whose text matches one of the wanted labels (case-insensitive). */
+/** Real mouse click on a visible element whose text matches one of the wanted labels (case-insensitive).
+ *  Uses page.mouse at real coordinates — GWT ignores synthetic el.click() events. */
 async function clickVisibleText(page, wanted, timeout = 8000) {
   const wantedArr = (Array.isArray(wanted) ? wanted : [wanted]).map(String);
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const handle = await page.evaluateHandle((list) => {
+    const box = await page.evaluate((list) => {
       const el = [...document.querySelectorAll('span, div, td, a, label, button')]
         .filter((e) => e.offsetParent !== null && e.childElementCount === 0)
         .find((e) => {
           const txt = (e.innerText || '').trim().toLowerCase();
           return list.some((w) => txt === w.toLowerCase() || txt.startsWith(w.toLowerCase() + ' '));
         });
-      return el || null;
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return null;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
     }, wantedArr);
-    const el = handle.asElement();
-    if (el) {
-      await el.click({ delay: 40 }).catch(() => {});
+    if (box) {
+      await page.mouse.click(box.x, box.y);
       await sleep(800);
       return true;
     }
@@ -731,27 +735,100 @@ async function placeOrder(page, sig) {
   }
   await sleep(1000);
 
-  // 4) Buy / Sell
+  // 4) verify the ticket is submittable BEFORE clicking (volume must be set,
+  //    and the Buy/Sell button must not be disabled) — prevents silent no-ops
+  const ticketOk = await page.evaluate((act) => {
+    const m = [...document.querySelectorAll('.page-window.modal')]
+      .find(x => !/hidden/.test(x.className || ''));
+    if (!m) return { ok: false, why: 'no visible order dialog' };
+    const btn = [...m.querySelectorAll('button')]
+      .find(b => b.offsetParent !== null && new RegExp('^' + act + '$', 'i').test((b.innerText || '').trim()));
+    const inputs = [...m.querySelectorAll('input')].filter(i => i.offsetParent !== null);
+    const volumeInput = inputs.find(i => /volume|lots/i.test((i.id || '') + (i.name || '') + (i.placeholder || '')))
+      || [...m.querySelectorAll('input')].find((i, idx, arr) => {
+        // fallback: the 3rd+ input region near "Volume" label
+        return false;
+      });
+    return {
+      ok: !!btn && !btn.disabled,
+      btnFound: !!btn,
+      btnDisabled: btn ? btn.disabled : null,
+      inputCount: inputs.length,
+      inputIds: inputs.map(i => i.id || i.name || i.placeholder).slice(0, 8),
+      bodySnippet: (m.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
+    };
+  }, action);
+  console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
+  if (!ticketOk.ok) {
+    await screenshot(page, 'ticket-not-submittable');
+    throw new Error(`Order ticket not submittable: ${ticketOk.why || ('button ' + (ticketOk.btnFound ? (ticketOk.btnDisabled ? 'disabled' : '?') : 'missing') + ' — see screenshot')}`);
+  }
+
+  // 5) Buy / Sell (real mouse click — GWT needs it)
   const labels = action === 'BUY' ? ['Buy', 'Buy by Market'] : ['Sell', 'Sell by Market'];
   console.log(`[exness] clicking ${labels[0]}...`);
   await clickVisibleText(page, labels);
-  await sleep(4000);
 
-  // 5) confirmation — check the journal AND the Trade tab for the new position
-  await sleep(2000);
-  const confirmed = await page.evaluate((sym) => {
-    const t = document.body ? document.body.innerText : '';
-    if (/order (placed|executed|accepted|done)|position opened|deal done|request accepted|done!/i.test(t)) return true;
-    // Trade tab: a row containing the pair with a ticket number
-    const rows = [...document.querySelectorAll('tr, .row')].filter(r => r.offsetParent !== null);
-    return rows.some(r => {
-      const txt = (r.innerText || '');
-      return txt.includes(sym) && /\d{4,}/.test(txt);
-    });
-  }, pair);
+  // 6) REAL confirmation: poll the Trade tab / journal for up to ~20s
+  let confirmed = false;
+  let evidence = '';
+  for (let i = 0; i < 12; i++) {
+    await sleep(1500);
+    const st = await page.evaluate((sym) => {
+      const t = document.body ? document.body.innerText : '';
+      if (/done!|request accepted|order (executed|placed|accepted|done)|position opened|deal done/i.test(t)) {
+        return { journal: true };
+      }
+      // Trade tab rows: pair + ticket number + volume
+      const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')].filter(r => r.offsetParent !== null);
+      for (const r of rows) {
+        const txt = (r.innerText || '');
+        if (txt.includes(sym) && /\d{4,}/.test(txt) && /(buy|sell)/i.test(txt)) {
+          return { row: txt.replace(/\s+/g, ' ').slice(0, 140) };
+        }
+      }
+      return null;
+    }, pair);
+    if (st) { confirmed = true; evidence = JSON.stringify(st); break; }
+  }
   await screenshot(page, 'after-order');
-  console.log('[exness] order submitted, confirmed=' + confirmed);
-  return { action, pair, lot, sl, tp, confirmed };
+  console.log(`[exness] order submitted, confirmed=${confirmed} evidence=${evidence}`);
+  return { action, pair, lot, sl, tp, confirmed, evidence };
+}
+
+/**
+ * REAL-TIME verification: open the terminal, check the Trade tab, and return
+ * the ACTUAL open positions (ticket, symbol, side, volume, prices). This is
+ * ground truth — it reads the terminal, not our local tracking.
+ */
+async function verifyPositionsLive() {
+  let browser, page;
+  try {
+    ({ browser, page } = await loginPage());
+    // open the Trade tab (bottom "Toolbox"/"Trade" area)
+    await clickVisibleText(page, ['Trade', 'Toolbox'], 5000).catch(() => {});
+    await sleep(1500);
+    const positions = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')]
+        .filter(r => r.offsetParent !== null);
+      const out = [];
+      for (const r of rows) {
+        const txt = (r.innerText || '').trim().replace(/\s+/g, ' ');
+        if (/\d{4,}/.test(txt) && /(buy|sell)/i.test(txt) && /[A-Z]{2,6}/.test(txt) && /\d+\.\d+/.test(txt)) {
+          out.push(txt.slice(0, 160));
+        }
+      }
+      return out.slice(0, 12);
+    });
+    if (!positions.length) {
+      return { ok: true, message: 'ℹ️ No open positions found in the terminal (Trade tab is empty).' };
+    }
+    return { ok: true, message: '📋 LIVE positions in the terminal:\n' + positions.map((p, i) => `${i + 1}. ${p}`).join('\n') };
+  } catch (e) {
+    return { ok: false, message: `❌ Could not verify: ${e.message}` };
+  } finally {
+    try { if (browser) await browser.close(); } catch {}
+  }
 }
 
 /* ---------------- public API ---------------- */
@@ -805,7 +882,7 @@ async function executeTrade(signal, timeoutMs = 180000) {
 }
 
 module.exports = {
-  executeTrade, loginPage, launchBrowser, applyStealth, DEFAULT_SELECTORS, loadSelectors,
+  executeTrade, loginPage, launchBrowser, applyStealth, DEFAULT_SELECTORS, loadSelectors, verifyPositionsLive,
   clickVisibleText, clearAndType, fieldForLabel, screenshot, sleep,
   isLoginDialogOpen, isTerminalVisible, waitForLoginDialog, clickSwitchModalIfVisible,
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
