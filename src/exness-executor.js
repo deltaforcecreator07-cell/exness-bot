@@ -113,6 +113,44 @@ async function isTerminalVisible(page) {
 }
 
 /** Real mouse click on a visible element whose text matches one of the wanted labels (case-insensitive). */
+/**
+ * Click the Buy/Sell button INSIDE the order ticket modal (real mouse).
+ * Scoped to the modal so we never hit the chart's "BUY/SELL" price labels
+ * (which appear earlier in the DOM and silently swallow clicks).
+ */
+async function clickTicketButton(page, action) {
+  const label = action === 'BUY' ? 'buy' : 'sell';
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const box = await page.evaluate((lbl) => {
+      const vis = (el) => el.offsetParent !== null;
+      // the order ticket modal is the visible modal that has a #volume input
+      const modal = [...document.querySelectorAll('.page-window.modal')]
+        .find(m => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+      const scope = modal || document;
+      // only real buttons / input-buttons inside the ticket
+      const el = [...scope.querySelectorAll('button, .input-button, [role="button"]')]
+        .filter(vis)
+        .find(b => {
+          const t = (b.innerText || '').trim().toLowerCase();
+          return t === lbl || t.startsWith(lbl + ' ') || t.startsWith(lbl + ':');
+        });
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return null;
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 24) };
+    }, label);
+    if (box) {
+      console.log(`[exness] clicking ticket ${label.toUpperCase()} button: "${box.text}"`);
+      await page.mouse.click(box.x, box.y);
+      await sleep(1000);
+      return true;
+    }
+    await sleep(700);
+  }
+  throw new Error(`ticket ${label.toUpperCase()} button not found in the order dialog`);
+}
+
 /** Real mouse click on a visible element whose text matches one of the wanted labels (case-insensitive).
  *  Uses page.mouse at real coordinates — GWT ignores synthetic el.click() events. */
 async function clickVisibleText(page, wanted, timeout = 8000) {
@@ -761,48 +799,50 @@ async function placeOrder(page, sig) {
   }
   await sleep(1000);
 
-  // 4) verify the ticket is submittable BEFORE clicking. The Buy/Sell buttons
-  //    are found document-wide (the visible modal may be the symbol dropdown).
-  const ticketOk = await page.evaluate((act) => {
+  // 4) verify the ticket is submittable BEFORE clicking — scoped to the modal,
+  //    and check the VALUES actually landed in volume/sl/tp (not just present).
+  const ticketOk = await page.evaluate((act, exp) => {
     const vis = (el) => el.offsetParent !== null;
-    const btn = [...document.querySelectorAll('button, [role="button"], div, span')]
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find(m => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    const scope = modal || document;
+    const btn = [...scope.querySelectorAll('button, .input-button, [role="button"]')]
       .filter(vis)
       .find(b => {
         const t = (b.innerText || '').trim();
-        return t && new RegExp('^' + act + '(:|$)', 'i').test(t) && b.children.length <= 2;
+        return t && new RegExp('^' + act + '(:| |$)', 'i').test(t);
       });
-    const inputs = [...document.querySelectorAll('input')].filter(vis);
-    const ids = inputs.map(i => (i.id || '').toLowerCase());
+    const val = (id) => {
+      const el = scope.querySelector('input#' + id);
+      return el ? el.value : null;
+    };
     return {
       ok: !!btn && !btn.disabled,
       btnFound: !!btn,
       btnText: btn ? (btn.innerText || '').trim().slice(0, 30) : null,
       btnDisabled: btn ? btn.disabled : null,
-      hasVolume: ids.includes('volume'),
-      hasSlTp: ids.includes('sl') && ids.includes('tp'),
-      inputIds: ids.slice(0, 10),
+      modalFound: !!modal,
+      volume: val('volume'),
+      sl: val('sl'),
+      tp: val('tp'),
+      symbolInput: (() => {
+        const inputs = [...scope.querySelectorAll('input')].filter(vis);
+        const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
+        const si = vi > 0 ? vi - 1 : -1;
+        return si >= 0 ? inputs[si].value : null;
+      })(),
     };
-  }, action);
+  }, action, { v: String(lot), s: String(sl ?? ''), t: String(tp ?? '') });
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
-  if (!ticketOk.ok || !ticketOk.hasVolume) {
-    // dump all buttons in the ticket area so we can adapt
-    const dump = await page.evaluate(() => {
-      const vis = (el) => el.offsetParent !== null;
-      return [...document.querySelectorAll('button, [role="button"], .input-button, div[class*="btn" i]')]
-        .filter(vis)
-        .map(b => ({ t: (b.innerText || '').trim().slice(0, 24), id: b.id, c: (b.className || '').toString().slice(0, 24) }))
-        .filter(x => x.t || x.id || x.c)
-        .slice(0, 25);
-    });
-    console.log('[exness] all ticket buttons:', JSON.stringify(dump));
+  if (!ticketOk.ok || !ticketOk.modalFound || ticketOk.volume !== String(lot)) {
+    console.warn(`[exness] ticket not ready: btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume="${ticketOk.volume}" (want "${lot}") sl="${ticketOk.sl}" tp="${ticketOk.tp}" symbol="${ticketOk.symbolInput}"`);
     await screenshot(page, 'ticket-not-submittable');
-    throw new Error(`Order ticket not submittable: ${ticketOk.why || ('btn=' + ticketOk.btnFound + ' volume=' + ticketOk.hasVolume + ' — see screenshot + button dump')}`);
+    throw new Error(`Order ticket not submittable (btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume=${ticketOk.volume}). See screenshot.`);
   }
 
-  // 5) Buy / Sell (real mouse click — GWT needs it)
-  const labels = action === 'BUY' ? ['Buy', 'Buy by Market'] : ['Sell', 'Sell by Market'];
-  console.log(`[exness] clicking ${labels[0]}...`);
-  await clickVisibleText(page, labels);
+  // 5) Buy / Sell — scoped to the ticket modal (real mouse; avoids chart labels)
+  console.log(`[exness] clicking ${action} (ticket-scoped)...`);
+  await clickTicketButton(page, action);
 
   // 6) handle any CONFIRMATION dialog: MT4 web shows "Buy 0.25 XAUUSD ... OK"
   //    after clicking Buy/Sell. If present, click OK / Yes (real mouse).
