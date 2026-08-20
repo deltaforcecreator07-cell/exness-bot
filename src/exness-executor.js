@@ -871,11 +871,22 @@ async function placeOrder(page, sig) {
     if (okBox) {
       console.log('[exness] confirmation dialog found, clicking OK...');
       await page.mouse.click(okBox.x, okBox.y);
-      await sleep(1500);
+      await sleep(2000);
     }
   } else {
     console.log('[exness] no confirmation dialog detected after Buy/Sell click');
   }
+
+  // 6b) THE definitive diagnostic: read the terminal JOURNAL after the order —
+  //     it states the real result/rejection reason in plain text.
+  await sleep(3000);
+  const journalAfter = await page.evaluate(() => {
+    const txt = document.body ? document.body.innerText : '';
+    const i = txt.lastIndexOf('Journal');
+    if (i < 0) return '(no journal found)';
+    return txt.slice(i, i + 800).replace(/\n+/g, ' | ');
+  });
+  console.log('[exness] JOURNAL AFTER ORDER:', journalAfter);
 
   // 6) REAL confirmation: poll the Trade tab / journal for up to ~20s
   let confirmed = false;
@@ -952,7 +963,13 @@ async function verifyPositionsLive() {
       return [...new Set(out)].slice(0, 12);
     });
     if (!positions.length) {
-      return { ok: true, message: 'ℹ️ No open positions found in the terminal (Trade tab is empty — nothing placed, or trade tab not visible).' };
+      // include the journal so we can see any order history / rejections
+      const journal = await page.evaluate(() => {
+        const txt = document.body ? document.body.innerText : '';
+        const i = txt.lastIndexOf('Journal');
+        return i >= 0 ? txt.slice(i, i + 600).replace(/\n+/g, ' | ') : '';
+      });
+      return { ok: true, message: 'ℹ️ No open positions found. Journal: ' + (journal || '(empty)') };
     }
     return { ok: true, message: '📋 LIVE positions in the terminal:\n' + positions.map((p, i) => `${i + 1}. ${p}`).join('\n') };
   } catch (e) {
