@@ -263,18 +263,21 @@ async function onMessage(msg) {
   const text = extractText(msg);
   if (!text || !text.trim()) return;
 
-  const sender = msg.key.participant || jid;
+  // Sender identity: WhatsApp now uses LIDs (@lid). Prefer the real phone JID
+  // (remoteJidAlt) when present, so ALLOWED_SENDERS (phone numbers) match.
+  const sender = msg.key.participant || msg.key.remoteJidAlt || jid;
+  const isSelf = !!msg.key.fromMe; // message from the bot's OWN account = the owner
 
   // DEBUG: log EVERY incoming message so you can see in Render logs whether
   // the bot receives your DMs / channel signals at all.
-  console.log(`[whatsapp:debug] jid=${jid} fromMe=${!!msg.key.fromMe} sender=${sender} txt=${text.slice(0, 80).replace(/\n/g, ' | ')}`);
+  console.log(`[whatsapp:debug] jid=${jid} fromMe=${isSelf} sender=${sender} txt=${text.slice(0, 80).replace(/\n/g, ' | ')}`);
 
   // Commands (/trade, /retake, /status, ...) are handled FIRST — before the
   // fromMe filter — so the owner can DM commands to their own number (self-DM)
   // and they still work. (When you message yourself, fromMe is true because
   // the message comes from the bot's own linked account.)
   const isCommand = /^\/(status|help|positions|retake|retry|trade|mode)\b/i.test(text.trim());
-  if (isCommand && senderAllowed(sender)) {
+  if (isCommand && (isSelf || senderAllowed(sender))) {
     const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
     return;
