@@ -276,7 +276,7 @@ async function onMessage(msg) {
   // fromMe filter — so the owner can DM commands to their own number (self-DM)
   // and they still work. (When you message yourself, fromMe is true because
   // the message comes from the bot's own linked account.)
-  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode)\b/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode|close|cancel)\b/i.test(text.trim());
   if (isCommand && (isSelf || senderAllowed(sender))) {
     const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
@@ -441,6 +441,15 @@ async function handleCommand(rawCmd, sender) {
   }
 
   // /mode [log|puppeteer] — switch execution mode instantly without restart
+  // /close (alias /cancel) — close the latest tracked position in the terminal
+  if (cmd === '/close' || cmd === '/cancel') {
+    const ps = listPositions();
+    if (!ps.length) return 'ℹ️ No tracked position to close. (If the bot restarted, tracking reset — close it in the MT app manually.)';
+    const latest = ps[ps.length - 1];
+    const res = await applyManagement({ action: 'close_position', pair: latest.pair, message: `close ${latest.pair} position` });
+    return res.message;
+  }
+
   if (cmd === '/mode' || cmd.startsWith('/mode ')) {
     const arg = rawCmd.replace(/^\/mode\s*/i, '').trim().toLowerCase();
     if (!arg) return `Current mode: ${currentMode()}\nUsage: /mode log | /mode puppeteer\n(log = dry-run, puppeteer = real trade)`;
@@ -485,6 +494,7 @@ async function handleCommand(rawCmd, sender) {
     '🤖 exness-signal-bot — commands:',
     '/status — bot status (shows current mode)',
     '/mode [log|puppeteer] — switch dry-run ↔ real trading instantly (no restart)',
+    '/close (or /cancel) — close the latest position',
     '/positions — tracked open positions',
     '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
     '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manually enter a trade (owner only)',
