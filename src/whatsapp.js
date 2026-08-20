@@ -399,7 +399,18 @@ async function handleTrade(sig) {
   } catch (e) {
     // transient failure (OOM guard, login hiccup) — KEEP pending so the bot
     // auto-retries on next connect; also available via /retake
-    return `❌ Execution failed: ${e.message}`;
+    const msg = `❌ Execution failed: ${e.message}`;
+    // if there's a screenshot, send it to the owner so they can SEE the state
+    if (e.screenshotPath && sock) {
+      try {
+        const owner = ownerJid();
+        if (owner) {
+          await sock.sendMessage(owner, { image: { url: e.screenshotPath }, caption: msg });
+          return msg + '\n(📸 screenshot sent to your DM)';
+        }
+      } catch (err) { console.error('[whatsapp] screenshot send failed:', err.message); }
+    }
+    return msg;
   }
 
   markExecuted(sig); // count only after success
