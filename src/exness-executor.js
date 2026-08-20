@@ -765,28 +765,40 @@ async function placeOrder(page, sig) {
   }, pair);
   if (symbolSet) {
     await sleep(800);
-    // click the option by PREFIX ("XAUUSD, Gold vs US Dollar" starts with XAUUSD)
+    // Find the dropdown item by its VISIBLE TEXT anywhere in the ticket modal
+    // (GWT combo items may not have class "option" — the earlier selector
+    //  missed them, so the dropdown never closed and blocked the Buy click).
     const optBox = await page.evaluate((sym) => {
-      const el = [...document.querySelectorAll('.option, .datalist .option, div[class*="option" i]')]
-        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+      const vis = (el) => el.offsetParent !== null;
+      const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
+      const scope = modal || document;
+      const el = [...scope.querySelectorAll('td, span, div, li, a, label, button')]
+        .filter(e => vis(e) && e.childElementCount === 0)
         .find(e => {
           const t = (e.innerText || '').trim();
-          return t.toUpperCase().startsWith(sym.toUpperCase() + ',') || t.toUpperCase() === sym.toUpperCase();
+          return t.toUpperCase().startsWith(sym.toUpperCase() + ',') ||
+                 t.toUpperCase() === sym.toUpperCase();
         });
       if (!el) return null;
       const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 40) };
     }, pair);
     if (optBox) {
       await page.mouse.click(optBox.x, optBox.y);
-      console.log('[exness] symbol option clicked (prefix match):', pair);
+      console.log('[exness] clicked dropdown item:', optBox.text);
     } else {
+      // fallback: GWT combo keyboard selection — Down arrow highlights the
+      // filtered item, Enter commits and closes the dropdown
+      await page.keyboard.press('ArrowDown');
+      await sleep(300);
       await page.keyboard.press('Enter');
-      console.log('[exness] no option found by prefix, pressed Enter');
+      console.log('[exness] no text match, used ArrowDown+Enter');
     }
-    await sleep(1800);
-    // verify the symbol value AND that the dropdown closed
-    const st = await page.evaluate((sym) => {
+    await sleep(1500);
+
+    // VERIFY the dropdown actually closed: the symbol description text
+    // ("Gold vs US Dollar") must NOT be visible anymore outside the input.
+    const dlg = await page.evaluate((sym) => {
       const vis = (el) => el.offsetParent !== null;
       const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
       const scope = modal || document;
@@ -794,21 +806,32 @@ async function placeOrder(page, sig) {
       const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
       const si = vi > 0 ? vi - 1 : 0;
       const val = inputs[si] ? inputs[si].value : '?';
-      // dropdown open if a visible option list is showing
-      const dropdownOpen = [...document.querySelectorAll('.datalist, div[class*="option" i]')].some(e => vis(e));
+      // dropdown open = any visible leaf text mentions the symbol description
+      const desc = sym === 'XAUUSD247' ? /gold vs us dollar|gold vs usd/i :
+        new RegExp(sym + '\\s*,', 'i');
+      const dropdownOpen = [...scope.querySelectorAll('td, span, div, li')]
+        .some(e => vis(e) && e.childElementCount === 0 && desc.test((e.innerText || '').trim()));
       return { val, dropdownOpen };
     }, pair);
-    console.log(`[exness] symbol after set: "${st.val}" (want ${pair}) dropdownOpen=${st.dropdownOpen}`);
-    if (st.val.toUpperCase() !== pair.toUpperCase()) {
-      console.warn('[exness] WARNING: symbol did not change — ticket still shows default!');
+    console.log(`[exness] symbol after select: "${dlg.val}" (want ${pair}) dropdownOpen=${dlg.dropdownOpen}`);
+    if (dlg.val.toUpperCase() !== pair.toUpperCase()) {
       await screenshot(page, 'symbol-not-set');
       throw new Error('Symbol did not change to ' + pair + ' in the ticket. See screenshot.');
     }
-    if (st.dropdownOpen) {
-      // try pressing Escape to close the dropdown
+    if (dlg.dropdownOpen) {
+      // the dropdown is still covering the ticket — press Escape to dismiss
       await page.keyboard.press('Escape');
-      await sleep(800);
-      console.log('[exness] pressed Escape to close symbol dropdown');
+      await sleep(1000);
+      const stillOpen = await page.evaluate(() => {
+        const vis = (el) => el.offsetParent !== null;
+        return [...document.querySelectorAll('td, span, div, li')]
+          .some(e => vis(e) && e.childElementCount === 0 && /gold vs us dollar/i.test((e.innerText || '').trim()));
+      });
+      console.log('[exness] after Escape, dropdown still open:', stillOpen);
+      if (stillOpen) {
+        await screenshot(page, 'dropdown-stuck');
+        throw new Error('Symbol dropdown would not close (Escape failed) — it blocks the Buy button. See screenshot.');
+      }
     }
   } else {
     console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
