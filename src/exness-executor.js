@@ -607,9 +607,19 @@ async function isOrderTicketOpen(page) {
  *  4) right-click a Market Watch row -> "New Order" context menu
  * If all fail, dumps the terminal UI so we can adapt.
  */
+/**
+ * Open the order ticket for a symbol following the REAL terminal flow
+ * (from the account owner's inspection):
+ *  1) click "Create a new chart"  (first toolbar button) -> opens a chart tab
+ *  2) in the chart, click the symbol dropdown ("Forex") -> opens the pair list
+ *  3) type the symbol to filter, then click the Gold row (XAUUSD247, 24/7)
+ *     -> the chart now shows that symbol
+ *  4) click "Create new order" (the second toolbar button) -> order ticket
+ *     for THAT symbol (no symbol-field fiddling needed)
+ */
 async function openOrderTicket(page, pair) {
   const tryWaitTicket = async (how) => {
-    const deadline = Date.now() + 6000;
+    const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
       if (await isOrderTicketOpen(page)) { console.log(`[exness] order ticket opened (${how})`); return true; }
       await sleep(1000);
@@ -617,7 +627,28 @@ async function openOrderTicket(page, pair) {
     return false;
   };
 
-  // focus the terminal by clicking the chart area
+  // helper: click the first visible element whose text/title matches
+  const clickText = async (re) => {
+    const box = await page.evaluate((rx) => {
+      const vis = (el) => el.offsetParent !== null;
+      const el = [...document.querySelectorAll('button, [role="button"], div, span, a, li, td')]
+        .filter(e => vis(e) && e.childElementCount === 0)
+        .find(e => new RegExp(rx, 'i').test((e.innerText || '').trim()) ||
+                   new RegExp(rx, 'i').test((e.title || '')));
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || el.title || '').trim().slice(0, 40) };
+    }, re);
+    if (box) {
+      await page.mouse.click(box.x, box.y);
+      await sleep(800);
+      console.log(`[exness] clicked: "${box.text}"`);
+      return true;
+    }
+    return false;
+  };
+
+  // 0) focus the terminal
   try {
     const cb = await page.evaluate(() => {
       const c = document.querySelector('canvas');
@@ -627,92 +658,94 @@ async function openOrderTicket(page, pair) {
     });
     if (cb) await page.mouse.click(cb.x, cb.y);
   } catch {}
-  await sleep(600);
+  await sleep(500);
 
-  // 1) F9
+  // 1) "Create a new chart" (first button) — opens a fresh chart tab
+  const chartClicked = await clickText('^New Chart$|Create a new chart|New Chart');
+  if (!chartClicked) {
+    // fallback: maybe a chart tab already exists; try F9
+    await page.keyboard.press('F9').catch(() => {});
+  }
+  await sleep(2000);
+
+  // 2) click the chart's symbol dropdown ("Forex" header / dropdown)
+  const dropdownClicked = await clickText('^Forex$|Forex \\u25bc|Forex \\u25be|^Forex:?$');
+  if (!dropdownClicked) {
+    // fallback: click the symbol combo in the chart toolbar (shows current symbol)
+    await clickText('USDCHF|EURUSD|GBPUSD|XAUUSD');
+  }
+  await sleep(2000);
+
+  // 3) type the symbol to filter the list, then click the Gold row
+  const typed = await page.evaluate((sym) => {
+    const vis = (el) => el.offsetParent !== null;
+    const input = [...document.querySelectorAll('input')]
+      .filter(vis)
+      .find(i => /symbol|search/i.test((i.id || '') + (i.name || '') + (i.placeholder || ''))) || null;
+    if (input) {
+      const proto = window.HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, sym);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.focus();
+      return true;
+    }
+    return false;
+  }, pair);
+  if (!typed) {
+    // type into whatever is focused after opening the dropdown
+    await page.keyboard.type(pair, { delay: 60 });
+  }
+  await sleep(1800);
+
+  const goldClicked = await page.evaluate((sym) => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('td, span, div, li, tr')]
+      .filter(e => vis(e) && e.childElementCount === 0)
+      .find(e => {
+        const t = (e.innerText || '').trim().toUpperCase();
+        return t.startsWith(sym.toUpperCase() + ',') || t === sym.toUpperCase();
+      });
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 40) };
+  }, pair);
+  if (goldClicked) {
+    await page.mouse.click(goldClicked.x, goldClicked.y);
+    console.log('[exness] clicked symbol row:', goldClicked.text);
+  } else {
+    // fallback: press Enter to select the highlighted filtered row
+    await page.keyboard.press('Enter');
+    console.log('[exness] symbol row not found by text — pressed Enter on filtered list');
+  }
+  await sleep(2500);
+
+  // 4) "Create new order" (second toolbar button) -> ticket for the chart's symbol
+  const orderClicked = await clickText('^New Order$|Create new order|New Order');
+  if (orderClicked && await tryWaitTicket('Create new order')) return;
+
+  // fallbacks if the chart-flow didn't yield a ticket
   await page.keyboard.press('F9').catch(() => {});
   if (await tryWaitTicket('F9')) return;
+  await clickText('^New Order$|Create new order');
+  if (await tryWaitTicket('New Order')) return;
 
-  // 2) Market Watch search + double-click symbol (real mouse)
-  const searchBox = await page.evaluate(() => {
-    const inputs = [...document.querySelectorAll('input')].filter(i => i.offsetParent !== null);
-    return inputs.find(i => /search|symbol/i.test((i.placeholder || '') + (i.name || '') + (i.id || ''))) || null;
-  });
-  if (searchBox) {
-    const sb = await searchBox.boundingBox();
-    if (sb) {
-      await page.mouse.click(sb.x + sb.width / 2, sb.y + sb.height / 2);
-      await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
-      await page.keyboard.type(pair, { delay: 60 });
-      await sleep(1800);
-      const rowBox = await page.evaluate((sym) => {
-        const el = [...document.querySelectorAll('td, span, div, tr')]
-          .filter(e => e.offsetParent !== null && e.childElementCount === 0)
-          .find(e => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      }, pair);
-      if (rowBox) {
-        await page.mouse.click(rowBox.x, rowBox.y, { clickCount: 2 });
-        if (await tryWaitTicket('market watch dblclick')) return;
-      }
-    }
-  }
-
-  // 3) toolbar "New Order" button (title/aria-label/class)
-  const btnBox = await page.evaluate(() => {
-    const el = [...document.querySelectorAll('button, [role="button"], a, div, span')]
-      .find(b => b.offsetParent !== null && /New Order/i.test((b.title || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.className || '')));
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (btnBox) {
-    await page.mouse.click(btnBox.x, btnBox.y);
-    if (await tryWaitTicket('toolbar button')) return;
-  }
-
-  // 4) right-click a Market Watch row -> New Order
-  const anyRowBox = await page.evaluate(() => {
-    const el = [...document.querySelectorAll('td, span, div, tr')]
-      .filter(e => e.offsetParent !== null && e.childElementCount === 0)
-      .find(e => /^[A-Z]{3,6}$/.test((e.innerText || '').trim()));
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (anyRowBox) {
-    await page.mouse.click(anyRowBox.x, anyRowBox.y, { button: 'right' });
-    await sleep(1200);
-    const ctxBox = await page.evaluate(() => {
-      const el = [...document.querySelectorAll('div, span, td, li, button')]
-        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
-        .find(e => /^New Order/i.test((e.innerText || '').trim()));
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    });
-    if (ctxBox) {
-      await page.mouse.click(ctxBox.x, ctxBox.y);
-      if (await tryWaitTicket('context menu')) return;
-    }
-  }
-
-  // diagnostic dump so we can adapt next iteration
   const dump = await page.evaluate(() => ({
     toolbar: [...document.querySelectorAll('button, [role="button"], [title]')]
       .filter(b => b.offsetParent !== null)
-      .map(b => ({ t: (b.innerText || b.title || b.getAttribute('aria-label') || '').trim().slice(0, 40), ti: (b.title || '').slice(0, 40), c: (b.className || '').toString().slice(0, 30) }))
-      .filter(x => x.t || x.ti)
+      .map(b => ({ t: (b.innerText || b.title || b.getAttribute('aria-label') || '').trim().slice(0, 40) }))
+      .filter(x => x.t)
       .slice(0, 30),
-    menus: [...document.querySelectorAll('.page-menu .item .label')].map(l => (l.innerText || '').trim()).filter(Boolean).slice(0, 25),
-    hasMarketWatch: /Market Watch/i.test(document.body ? document.body.innerText : ''),
-    inputs: [...document.querySelectorAll('input')].filter(i => i.offsetParent !== null).map(i => ({ ph: i.placeholder, id: i.id, cls: (i.className || '').toString().slice(0, 20) })),
+    texts: [...new Set(
+      [...document.querySelectorAll('td, span, div')]
+        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+        .map(e => (e.innerText || '').trim())
+        .filter(t => t && t.length < 50)
+    )].slice(0, 40),
   }));
   console.log('[exness] terminal dump (no ticket):', JSON.stringify(dump));
   await screenshot(page, 'no-order-ticket');
-  throw new Error('Could not open the order ticket (F9 / market watch / toolbar / context all failed). See screenshot + terminal dump.');
+  throw new Error('Could not open the order ticket via Create-new-chart flow. See screenshot + terminal dump.');
 }
 
 /**
@@ -1038,8 +1071,15 @@ async function verifyPositionsLive() {
 
 /* ---------------- public API ---------------- */
 
+// queue of pending signals (a signal arriving while another trade is being
+// placed must NOT be dropped — it runs right after the current one finishes)
+const queue = [];
+
 async function executeTrade(signal, timeoutMs = 180000) {
-  if (busy) throw new Error('another execution is already in progress');
+  if (busy) {
+    queue.push(signal);
+    throw new Error('another execution is in progress — signal QUEUED, will run next');
+  }
   cleanupScreenshots();
 
   // OOM guard that WAITS instead of failing: if memory is high (usually because
@@ -1076,6 +1116,12 @@ async function executeTrade(signal, timeoutMs = 180000) {
       try { if (browser) await browser.close(); } catch {}
       busy = false;
       console.log('[exness] browser closed (memory released)');
+      // drain any queued signal so nothing is ever dropped
+      if (queue.length) {
+        const next = queue.shift();
+        console.log('[exness] executing queued signal:', JSON.stringify(next));
+        setTimeout(() => executeTrade(next).catch(e => console.error('[exness] queued signal failed:', e.message)), 100);
+      }
     }
   })();
 
@@ -1086,6 +1132,12 @@ async function executeTrade(signal, timeoutMs = 180000) {
     return await Promise.race([run, timer]);
   } catch (e) {
     busy = false;
+    // still drain the queue on failure
+    if (queue.length) {
+      const next = queue.shift();
+      console.log('[exness] executing queued signal after failure:', JSON.stringify(next));
+      setTimeout(() => executeTrade(next).catch(err => console.error('[exness] queued signal failed:', err.message)), 100);
+    }
     throw e;
   }
 }
