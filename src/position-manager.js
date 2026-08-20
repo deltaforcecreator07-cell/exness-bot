@@ -64,28 +64,52 @@ async function clickContextItem(page, textRe) {
 
 /* ---------------- operations ---------------- */
 
+/** Real-mouse right-click on an element (GWT needs real events). */
+async function realRightClick(page, box) {
+  await page.mouse.move(box.x, box.y);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.up({ button: 'right' });
+  await sleep(1000);
+}
+
+/** Click the first visible element whose text matches (real mouse at coords). */
+async function realClickText(page, regex) {
+  const box = await page.evaluate((re) => {
+    const el = [...document.querySelectorAll('div, span, td, li, button, a')]
+      .filter(e => e.offsetParent !== null && e.childElementCount === 0)
+      .find(e => new RegExp(re, 'i').test((e.innerText || '').trim()));
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, regex);
+  if (!box) return null;
+  await page.mouse.click(box.x, box.y);
+  await sleep(800);
+  return box;
+}
+
 async function closePositionOp(page, pair) {
   await openTradeTab(page);
   const row = await findPositionRow(page, pair);
   if (!row) throw new Error(`position ${pair} not visible in the Trade tab (screenshot saved)`);
+  const r = await row.boundingBox();
+  if (!r) throw new Error(`position ${pair} row has no box (screenshot saved)`);
   await screenshot(page, 'pos-row');
-  await rightClickElement(page, row);
-  const item = await clickContextItem(page, '^Close|Close position|Close by');
+  // real right-click on the row
+  await realRightClick(page, { x: r.x + r.width / 2, y: r.y + r.height / 2 });
+  const item = await realClickText(page, '^Close (Position)?$|^Close by$|Close position');
   if (!item) {
     await screenshot(page, 'pos-context');
     throw new Error('right-click menu did not show "Close" (screenshot saved)');
   }
   await sleep(1500);
-  // confirm: there is usually a confirmation dialog with a "Close" button
-  const confirmed = await page.evaluate(() => {
-    const btn = [...document.querySelectorAll('button')]
-      .find((b) => b.offsetParent !== null && /^Close$/i.test((b.innerText || '').trim()));
-    if (btn) { btn.click(); return true; }
-    return false;
-  });
+  // confirm: a confirmation dialog may appear with a "Close" button — click it
+  let confirmed = false;
+  const closeBtn = await realClickText(page, '^Close$');
+  if (closeBtn) confirmed = true;
   await sleep(3000);
   await screenshot(page, 'pos-closed');
-  console.log(`[posman] close ${pair}: menu="${item}" confirmed=${confirmed}`);
+  console.log(`[posman] close ${pair}: menu clicked, confirmed=${confirmed}`);
   return { confirmed };
 }
 
