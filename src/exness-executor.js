@@ -359,6 +359,23 @@ async function performLogin(page, login, pass, server) {
   await page.keyboard.type(String(pass), { delay: 50 });
   await sleep(800);
 
+  // VERIFY what actually landed in the fields (password masked) — catches
+  // cases where typing went to the wrong field or special chars got mangled.
+  const fields = await page.evaluate(() => {
+    const all = [...document.querySelectorAll('input')].filter((i) => i.offsetParent !== null);
+    const pw = all.find((i) => i.type === 'password');
+    const loginEl = all.find((i, idx) => idx === all.findIndex((x) => x.type === 'password') - 1 && i.type === 'text');
+    return {
+      loginVal: loginEl ? loginEl.value : '(not found)',
+      pwLen: pw ? pw.value.length : 0,
+      serverVal: document.querySelector('#server')?.value || '(not found)',
+    };
+  });
+  console.log(`[exness] field check -> login="${fields.loginVal}" pwLen=${fields.pwLen} server="${fields.serverVal}"`);
+  if (fields.loginVal !== String(login)) console.warn(`[exness] WARNING: login field value "${fields.loginVal}" != expected "${login}"`);
+  if (fields.pwLen !== String(pass).length) console.warn(`[exness] WARNING: password length ${fields.pwLen} != expected ${String(pass).length} (special chars?)`);
+  if (fields.serverVal !== server) console.warn(`[exness] WARNING: server field "${fields.serverVal}" != expected "${server}"`);
+
   // --- OK (wait until enabled, then click) ---
   const enabled = await waitForOkEnabled(page);
   console.log('[exness] OK enabled:', enabled);
@@ -392,6 +409,14 @@ async function loginFlow(page) {
   console.log('[exness] server candidates:', servers.join(' | '));
 
   console.log('[exness] opening', url);
+  // Track WebSocket attempts — tells us if the app is trying to reach the
+  // trade server at all (and to which host).
+  let wsAttempts = [];
+  page.on('websocket', (ws) => {
+    const u = ws.url() || '';
+    wsAttempts.push(u);
+    console.log('[exness] WS opened:', u.slice(0, 100));
+  });
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await sleep(5000);
 
@@ -425,7 +450,36 @@ async function loginFlow(page) {
       continue; // next attempt logs in on the (now MT5) dialog
     }
 
-    await sleep(2000);
+    // DIAGNOSTIC: after OK, capture what the app is showing — visible modals,
+    // any error/status text, journal tail, websocket count. This tells us WHY
+    // the dialog stays open (auth failed? connection refused? 2FA? too slow?).
+    // Watch up to ~12s (some trade-server connections are slow).
+    const diagSnapshots = [];
+    for (let s = 0; s < 4; s++) {
+      await sleep(3000);
+      const diag = await page.evaluate(() => {
+        const txt = document.body ? document.body.innerText : '';
+        const lines = txt.split('\n').map(x => x.trim()).filter(Boolean);
+        return {
+          visibleModals: [...document.querySelectorAll('.page-window.modal')]
+            .filter(m => !/hidden/.test(m.className || ''))
+            .map(m => (m.querySelector('.h')?.innerText || '').trim().slice(0, 60)),
+          errorText: lines.filter(l => /fail|error|invalid|incorrect|wrong|denied|reject|offline|timeout|otp|verif|code|password|connect|auth/i.test(l)).slice(0, 8),
+          journalTail: (() => {
+            const i = txt.lastIndexOf('Journal');
+            return i >= 0 ? txt.slice(i, i + 300).replace(/\n+/g, ' | ') : '';
+          })(),
+          hasCanvas: document.querySelectorAll('canvas').length > 0,
+        };
+      });
+      diagSnapshots.push(diag);
+      // stop early if dialog closed
+      if (!(await isLoginDialogOpen(page))) break;
+    }
+    console.log('[exness] POST-OK DIAGNOSTIC:', JSON.stringify(diagSnapshots));
+    console.log('[exness] WS attempts this run:', JSON.stringify(wsAttempts));
+    wsAttempts = [];
+
     const stillOpen = await isLoginDialogOpen(page);
     const terminalOk = await isTerminalVisible(page);
     if (!stillOpen && terminalOk) {
