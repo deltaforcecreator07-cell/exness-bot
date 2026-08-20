@@ -71,7 +71,8 @@ async function screenshot(page, name) {
     const p = path.join(SHOT_DIR, `${name}-${now()}.png`);
     await page.screenshot({ path: p });
     console.log('[exness] 📸 screenshot:', p);
-  } catch (e) { console.warn('[exness] screenshot failed:', e.message); }
+    return p;
+  } catch (e) { console.warn('[exness] screenshot failed:', e.message); return null; }
 }
 
 async function waitFor(page, fn, timeout, label) {
@@ -780,23 +781,22 @@ async function placeOrder(page, sig) {
     console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
   }
 
-  // 3) volume / SL / TP by label (tolerant matching)
-  const volumeField = await fieldForLabel(page, 'Volume');
-  if (volumeField.asElement()) {
-    await clearAndType(page, volumeField.asElement(), String(lot));
-  } else {
-    console.warn('[exness] Volume field not found (run dump-dom to update)');
-  }
-  if (sl != null) {
-    const slField = await fieldForLabel(page, 'Stop Loss');
-    if (slField.asElement()) await clearAndType(page, slField.asElement(), String(sl));
-    else console.warn('[exness] Stop Loss field not found');
-  }
-  if (tp != null) {
-    const tpField = await fieldForLabel(page, 'Take Profit');
-    if (tpField.asElement()) await clearAndType(page, tpField.asElement(), String(tp));
-    else console.warn('[exness] Take Profit field not found');
-  }
+  // 3) volume / SL / TP — use their input IDs directly. GWT labels are
+  //    absolutely positioned (no row structure), so label-scoping grabs the
+  //    WRONG inputs (that's how the TP value ended up in the Volume field).
+  const setInput = async (id, value) => {
+    const el = await page.$('#' + id);
+    if (!el) {
+      console.warn('[exness] input#' + id + ' not found');
+      return false;
+    }
+    await clearAndType(page, el, String(value));
+    console.log('[exness] set #' + id + ' = ' + String(value));
+    return true;
+  };
+  await setInput('volume', lot);
+  if (sl != null) await setInput('sl', sl);
+  if (tp != null) await setInput('tp', tp);
   await sleep(1000);
 
   // 4) verify the ticket is submittable BEFORE clicking — scoped to the modal,
@@ -991,7 +991,11 @@ async function executeTrade(signal, timeoutMs = 180000) {
       const result = await placeOrder(page, signal);
       return result;
     } catch (e) {
-      if (page) await screenshot(page, 'error').catch(() => {});
+      // attach the latest screenshot path so the WhatsApp side can send it to you
+      if (page) {
+        const p = await screenshot(page, 'error').catch(() => null);
+        if (p) e.screenshotPath = p;
+      }
       console.error('[exness] execution FAILED:', e.message);
       throw e;
     } finally {
