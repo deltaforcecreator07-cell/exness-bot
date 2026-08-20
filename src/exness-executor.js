@@ -737,11 +737,18 @@ async function placeOrder(page, sig) {
   await clickVisibleText(page, labels);
   await sleep(4000);
 
-  // 5) confirmation
-  const confirmed = await page.evaluate(() => {
+  // 5) confirmation — check the journal AND the Trade tab for the new position
+  await sleep(2000);
+  const confirmed = await page.evaluate((sym) => {
     const t = document.body ? document.body.innerText : '';
-    return /order (placed|executed|accepted|done)|position opened/i.test(t);
-  });
+    if (/order (placed|executed|accepted|done)|position opened|deal done|request accepted|done!/i.test(t)) return true;
+    // Trade tab: a row containing the pair with a ticket number
+    const rows = [...document.querySelectorAll('tr, .row')].filter(r => r.offsetParent !== null);
+    return rows.some(r => {
+      const txt = (r.innerText || '');
+      return txt.includes(sym) && /\d{4,}/.test(txt);
+    });
+  }, pair);
   await screenshot(page, 'after-order');
   console.log('[exness] order submitted, confirmed=' + confirmed);
   return { action, pair, lot, sl, tp, confirmed };
