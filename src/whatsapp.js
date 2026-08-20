@@ -276,7 +276,7 @@ async function onMessage(msg) {
   // fromMe filter — so the owner can DM commands to their own number (self-DM)
   // and they still work. (When you message yourself, fromMe is true because
   // the message comes from the bot's own linked account.)
-  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode|close|cancel)\b/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode|close|cancel|verify)\b/i.test(text.trim());
   if (isCommand && (isSelf || senderAllowed(sender))) {
     const reply = await handleCommand(text.trim(), sender);
     if (reply) await sock.sendMessage(jid, { text: reply });
@@ -441,6 +441,13 @@ async function handleCommand(rawCmd, sender) {
   }
 
   // /mode [log|puppeteer] — switch execution mode instantly without restart
+  // /verify — read ACTUAL open positions from the terminal (real-time ground truth)
+  if (cmd === '/verify') {
+    const { verifyPositionsLive } = require('./exness-executor');
+    const res = await verifyPositionsLive();
+    return res.message;
+  }
+
   // /close (alias /cancel) — close the latest tracked position in the terminal
   if (cmd === '/close' || cmd === '/cancel') {
     const ps = listPositions();
@@ -495,6 +502,7 @@ async function handleCommand(rawCmd, sender) {
     '/status — bot status (shows current mode)',
     '/mode [log|puppeteer] — switch dry-run ↔ real trading instantly (no restart)',
     '/close (or /cancel) — close the latest position',
+    '/verify — check ACTUAL open positions in the terminal (real-time)',
     '/positions — tracked open positions',
     '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
     '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manually enter a trade (owner only)',
