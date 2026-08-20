@@ -686,37 +686,34 @@ async function placeOrder(page, sig) {
   await openOrderTicket(page, pair);
   await screenshot(page, 'order-ticket');
 
-  // 2) set the SYMBOL inside the ticket. The symbol field is a combo: set the
-  //    value, then CLICK the matching option in the dropdown to commit it
-  //    (otherwise the dropdown stays open and the ticket isn't submittable).
+  // 2) set the SYMBOL. The ticket's symbol combo is the input right BEFORE the
+  //    volume field (the combos have no id/name in this terminal). Set its
+  //    value, then CLICK the matching dropdown option to commit.
   const symbolSet = await page.evaluate((sym) => {
     const vis = (el) => el.offsetParent !== null;
-    // find the symbol input anywhere (id/name/placeholder containing symbol)
-    let input = [...document.querySelectorAll('input')]
-      .filter(vis)
-      .find(i => /symbol/i.test((i.id || '') + (i.name || '') + (i.placeholder || '')));
-    if (!input) {
-      const label = [...document.querySelectorAll('td, div, span, label')]
-        .find(c => vis(c) && c.childElementCount === 0 && /^Symbol:?$/i.test((c.innerText || '').trim()));
-      if (label) {
-        const row = label.closest('tr') || label.parentElement;
-        input = row ? row.querySelector('input') : null;
-      }
-    }
-    if (!input) return false;
+    const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
+    const scope = modal || document;
+    const inputs = [...scope.querySelectorAll('input')].filter(vis);
+    const volIdx = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
+    const symInput = volIdx > 0 ? inputs[volIdx - 1] : (inputs[0] || null);
+    if (!symInput) return false;
     const proto = window.HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, sym);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(symInput, sym);
+    symInput.dispatchEvent(new Event('input', { bubbles: true }));
+    symInput.dispatchEvent(new Event('change', { bubbles: true }));
+    symInput.focus();
     return true;
   }, pair);
   if (symbolSet) {
-    console.log('[exness] symbol value set, committing by clicking the option...');
-    // click the exact symbol option in the dropdown (real mouse)
+    await sleep(800);
+    // commit by clicking the exact option (real mouse) or pressing Enter
     const optBox = await page.evaluate((sym) => {
       const el = [...document.querySelectorAll('.option, .datalist .option, td, div, span')]
         .filter(e => e.offsetParent !== null && e.childElementCount === 0)
-        .find(e => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
+        .find(e => {
+          const t = (e.innerText || '').trim().toUpperCase();
+          return t === sym.toUpperCase() || t.startsWith(sym.toUpperCase() + ',');
+        });
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
@@ -729,6 +726,18 @@ async function placeOrder(page, sig) {
       console.log('[exness] no option found, pressed Enter');
     }
     await sleep(1500);
+    // verify the symbol actually changed
+    const val = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
+      const scope = modal || document;
+      const inputs = [...scope.querySelectorAll('input')].filter(vis);
+      const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
+      const si = vi > 0 ? vi - 1 : 0;
+      return inputs[si] ? inputs[si].value : '?';
+    });
+    console.log(`[exness] symbol value after set: "${val}" (expected ${pair})`);
+    if (val.toUpperCase() !== pair.toUpperCase()) console.warn('[exness] WARNING: symbol may not be set — ticket may still show the chart default!');
   } else {
     console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
   }
@@ -795,6 +804,39 @@ async function placeOrder(page, sig) {
   console.log(`[exness] clicking ${labels[0]}...`);
   await clickVisibleText(page, labels);
 
+  // 6) handle any CONFIRMATION dialog: MT4 web shows "Buy 0.25 XAUUSD ... OK"
+  //    after clicking Buy/Sell. If present, click OK / Yes (real mouse).
+  const confirmHandled = await page.evaluate((act) => {
+    const vis = (el) => el.offsetParent !== null;
+    const m = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
+    if (!m) return false;
+    const txt = (m.innerText || '');
+    // a confirmation dialog mentions the order details + has OK / Yes
+    const hasOk = [...m.querySelectorAll('button')].some(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
+    if (hasOk && /(buy|sell|order|volume|market)/i.test(txt)) {
+      return true; // signal to click OK below
+    }
+    return false;
+  }, action);
+  if (confirmHandled) {
+    const okBox = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      const m = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
+      if (!m) return null;
+      const btn = [...m.querySelectorAll('button')].find(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
+      if (!btn) return null;
+      const r = btn.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (okBox) {
+      console.log('[exness] confirmation dialog found, clicking OK...');
+      await page.mouse.click(okBox.x, okBox.y);
+      await sleep(1500);
+    }
+  } else {
+    console.log('[exness] no confirmation dialog detected after Buy/Sell click');
+  }
+
   // 6) REAL confirmation: poll the Trade tab / journal for up to ~20s
   let confirmed = false;
   let evidence = '';
@@ -831,23 +873,46 @@ async function verifyPositionsLive() {
   let browser, page;
   try {
     ({ browser, page } = await loginPage());
-    // open the Trade tab (bottom "Toolbox"/"Trade" area)
-    await clickVisibleText(page, ['Trade', 'Toolbox'], 5000).catch(() => {});
-    await sleep(1500);
+    // open the Trade tab: it's a bottom toolbar tab, often in a tab bar.
+    // Click any small visible element whose text is exactly "Trade".
+    const clicked = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      const candidates = [...document.querySelectorAll('div, span, td, button, a')]
+        .filter(e => vis(e) && e.childElementCount === 0)
+        .filter(e => (e.innerText || '').trim() === 'Trade')
+        .map(e => e.getBoundingClientRect())
+        .filter(r => r.width > 0 && r.width < 120 && r.height > 0 && r.height < 40);
+      if (!candidates.length) return false;
+      const r = candidates[0];
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    });
+    if (clicked) {
+      await page.mouse.click(clicked.x, clicked.y);
+      await sleep(1800);
+    }
     const positions = await page.evaluate(() => {
-      const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')]
-        .filter(r => r.offsetParent !== null);
+      const vis = (el) => el.offsetParent !== null;
       const out = [];
+      // 1) table rows with ticket-like numbers + buy/sell + symbol + price
+      const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')].filter(vis);
       for (const r of rows) {
         const txt = (r.innerText || '').trim().replace(/\s+/g, ' ');
         if (/\d{4,}/.test(txt) && /(buy|sell)/i.test(txt) && /[A-Z]{2,6}/.test(txt) && /\d+\.\d+/.test(txt)) {
           out.push(txt.slice(0, 160));
         }
       }
-      return out.slice(0, 12);
+      if (!out.length) {
+        // 2) fallback: any visible line containing a pair + buy/sell + number
+        const lines = (document.body ? document.body.innerText : '').split('\n').map(s => s.trim()).filter(Boolean);
+        for (const l of lines) {
+          if (/(buy|sell)/i.test(l) && /[A-Z]{2,6}/.test(l) && /\d{4,}/.test(l)) out.push(l.replace(/\s+/g, ' ').slice(0, 160));
+        }
+      }
+      // dedupe
+      return [...new Set(out)].slice(0, 12);
     });
     if (!positions.length) {
-      return { ok: true, message: 'ℹ️ No open positions found in the terminal (Trade tab is empty).' };
+      return { ok: true, message: 'ℹ️ No open positions found in the terminal (Trade tab is empty — nothing placed, or trade tab not visible).' };
     }
     return { ok: true, message: '📋 LIVE positions in the terminal:\n' + positions.map((p, i) => `${i + 1}. ${p}`).join('\n') };
   } catch (e) {
