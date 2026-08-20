@@ -715,8 +715,27 @@ async function openOrderTicket(page, pair) {
   throw new Error('Could not open the order ticket (F9 / market watch / toolbar / context all failed). See screenshot + terminal dump.');
 }
 
+/**
+ * Map a logical pair (XAUUSD from the parser) to the account's REAL terminal
+ * symbol. Your Exness MT4 account lists gold as "XAUUSD247, Gold vs US Dollar
+ * 24/7" — plain XAUUSD doesn't exist in the dropdown, which is why the symbol
+ * never changed and orders silently failed. Override via SYMBOL_ALIASES env.
+ */
+function symbolAliases() {
+  try {
+    return { XAUUSD: 'XAUUSD247', GOLD: 'XAUUSD247', ...JSON.parse(process.env.SYMBOL_ALIASES || '{}') };
+  } catch {
+    return { XAUUSD: 'XAUUSD247', GOLD: 'XAUUSD247' };
+  }
+}
+function terminalSymbol(pair) {
+  const a = symbolAliases();
+  return a[pair] || a[pair?.toUpperCase()] || pair;
+}
+
 async function placeOrder(page, sig) {
-  const { action, pair, lot, sl, tp } = sig;
+  const { action, lot, sl, tp } = sig;
+  const pair = terminalSymbol(sig.pair); // XAUUSD -> XAUUSD247 for this account
 
   // 0) sanity: if the login dialog is somehow still open, stop
   if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
@@ -725,9 +744,10 @@ async function placeOrder(page, sig) {
   await openOrderTicket(page, pair);
   await screenshot(page, 'order-ticket');
 
-  // 2) set the SYMBOL. The ticket's symbol combo is the input right BEFORE the
-  //    volume field (the combos have no id/name in this terminal). Set its
-  //    value, then CLICK the matching dropdown option to commit.
+  // 2) set the SYMBOL. The symbol combo options read "XAUUSD, Gold vs US Dollar"
+  //    (symbol + description), so match by PREFIX. After picking, the dropdown
+  //    must CLOSE — if it stays open it blocks the Buy/Sell click (that was
+  //    the real reason orders never placed).
   const symbolSet = await page.evaluate((sym) => {
     const vis = (el) => el.offsetParent !== null;
     const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
@@ -745,13 +765,13 @@ async function placeOrder(page, sig) {
   }, pair);
   if (symbolSet) {
     await sleep(800);
-    // commit by clicking the exact option (real mouse) or pressing Enter
+    // click the option by PREFIX ("XAUUSD, Gold vs US Dollar" starts with XAUUSD)
     const optBox = await page.evaluate((sym) => {
-      const el = [...document.querySelectorAll('.option, .datalist .option, td, div, span')]
+      const el = [...document.querySelectorAll('.option, .datalist .option, div[class*="option" i]')]
         .filter(e => e.offsetParent !== null && e.childElementCount === 0)
         .find(e => {
-          const t = (e.innerText || '').trim().toUpperCase();
-          return t === sym.toUpperCase() || t.startsWith(sym.toUpperCase() + ',');
+          const t = (e.innerText || '').trim();
+          return t.toUpperCase().startsWith(sym.toUpperCase() + ',') || t.toUpperCase() === sym.toUpperCase();
         });
       if (!el) return null;
       const r = el.getBoundingClientRect();
@@ -759,24 +779,37 @@ async function placeOrder(page, sig) {
     }, pair);
     if (optBox) {
       await page.mouse.click(optBox.x, optBox.y);
-      console.log('[exness] symbol option clicked:', pair);
+      console.log('[exness] symbol option clicked (prefix match):', pair);
     } else {
       await page.keyboard.press('Enter');
-      console.log('[exness] no option found, pressed Enter');
+      console.log('[exness] no option found by prefix, pressed Enter');
     }
-    await sleep(1500);
-    // verify the symbol actually changed
-    const val = await page.evaluate(() => {
+    await sleep(1800);
+    // verify the symbol value AND that the dropdown closed
+    const st = await page.evaluate((sym) => {
       const vis = (el) => el.offsetParent !== null;
       const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
       const scope = modal || document;
       const inputs = [...scope.querySelectorAll('input')].filter(vis);
       const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
       const si = vi > 0 ? vi - 1 : 0;
-      return inputs[si] ? inputs[si].value : '?';
-    });
-    console.log(`[exness] symbol value after set: "${val}" (expected ${pair})`);
-    if (val.toUpperCase() !== pair.toUpperCase()) console.warn('[exness] WARNING: symbol may not be set — ticket may still show the chart default!');
+      const val = inputs[si] ? inputs[si].value : '?';
+      // dropdown open if a visible option list is showing
+      const dropdownOpen = [...document.querySelectorAll('.datalist, div[class*="option" i]')].some(e => vis(e));
+      return { val, dropdownOpen };
+    }, pair);
+    console.log(`[exness] symbol after set: "${st.val}" (want ${pair}) dropdownOpen=${st.dropdownOpen}`);
+    if (st.val.toUpperCase() !== pair.toUpperCase()) {
+      console.warn('[exness] WARNING: symbol did not change — ticket still shows default!');
+      await screenshot(page, 'symbol-not-set');
+      throw new Error('Symbol did not change to ' + pair + ' in the ticket. See screenshot.');
+    }
+    if (st.dropdownOpen) {
+      // try pressing Escape to close the dropdown
+      await page.keyboard.press('Escape');
+      await sleep(800);
+      console.log('[exness] pressed Escape to close symbol dropdown');
+    }
   } else {
     console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
   }
@@ -844,74 +877,75 @@ async function placeOrder(page, sig) {
   console.log(`[exness] clicking ${action} (ticket-scoped)...`);
   await clickTicketButton(page, action);
 
-  // 6) handle any CONFIRMATION dialog: MT4 web shows "Buy 0.25 XAUUSD ... OK"
-  //    after clicking Buy/Sell. If present, click OK / Yes (real mouse).
-  const confirmHandled = await page.evaluate((act) => {
-    const vis = (el) => el.offsetParent !== null;
-    const m = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
-    if (!m) return false;
-    const txt = (m.innerText || '');
-    // a confirmation dialog mentions the order details + has OK / Yes
-    const hasOk = [...m.querySelectorAll('button')].some(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
-    if (hasOk && /(buy|sell|order|volume|market)/i.test(txt)) {
-      return true; // signal to click OK below
-    }
-    return false;
-  }, action);
-  if (confirmHandled) {
-    const okBox = await page.evaluate(() => {
+  // 6) SUCCESS = the order ticket closes. In MT4 web, a placed order closes
+  //    the ticket (the modal with #volume disappears). Wait up to ~20s for that.
+  //    If a confirmation dialog ("Buy 0.14 XAUUSD ... OK") appears, click OK.
+  let confirmed = false;
+  let evidence = '';
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline) {
+    // if a confirmation dialog (distinct from the ticket) is showing, click OK
+    const confirmBox = await page.evaluate(() => {
       const vis = (el) => el.offsetParent !== null;
-      const m = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
-      if (!m) return null;
-      const btn = [...m.querySelectorAll('button')].find(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
+      const modals = [...document.querySelectorAll('.page-window.modal')].filter(m => !/hidden/.test(m.className || ''));
+      const ticket = modals.find(m => m.querySelector('input#volume'));
+      const other = modals.find(m => !m.querySelector('input#volume') && /(buy|sell|order|market)/i.test(m.innerText || ''));
+      if (!other) return null;
+      const btn = [...other.querySelectorAll('button')].find(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
       if (!btn) return null;
       const r = btn.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, title: (other.querySelector('.h')?.innerText || '').trim().slice(0, 40) };
     });
-    if (okBox) {
-      console.log('[exness] confirmation dialog found, clicking OK...');
-      await page.mouse.click(okBox.x, okBox.y);
-      await sleep(2000);
+    if (confirmBox) {
+      console.log('[exness] confirm dialog found, clicking OK:', confirmBox.title);
+      await page.mouse.click(confirmBox.x, confirmBox.y);
+      await sleep(1500);
+      continue;
     }
-  } else {
-    console.log('[exness] no confirmation dialog detected after Buy/Sell click');
+    // ticket still open? keep waiting
+    const ticketStillOpen = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      const m = [...document.querySelectorAll('.page-window.modal')]
+        .find(x => !/hidden/.test(x.className || '') && x.querySelector('input#volume'));
+      return !!m;
+    });
+    if (!ticketStillOpen) {
+      // ticket closed — check the Trade tab / journal for the position
+      const st = await page.evaluate((sym) => {
+        const t = document.body ? document.body.innerText : '';
+        if (/done!|request accepted|order (executed|placed|accepted|done)|position opened|deal done/i.test(t)) {
+          return { journal: true };
+        }
+        const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')].filter(r => r.offsetParent !== null);
+        for (const r of rows) {
+          const txt = (r.innerText || '');
+          if (txt.includes(sym) && /\d{4,}/.test(txt) && /(buy|sell)/i.test(txt)) {
+            return { row: txt.replace(/\s+/g, ' ').slice(0, 140) };
+          }
+        }
+        return null;
+      }, pair);
+      if (st) { confirmed = true; evidence = JSON.stringify(st); }
+      break;
+    }
+    await sleep(1200);
   }
 
-  // 6b) THE definitive diagnostic: read the terminal JOURNAL after the order —
-  //     it states the real result/rejection reason in plain text.
-  await sleep(3000);
+  // journal dump (ground truth) regardless of outcome
   const journalAfter = await page.evaluate(() => {
     const txt = document.body ? document.body.innerText : '';
     const i = txt.lastIndexOf('Journal');
     if (i < 0) return '(no journal found)';
-    return txt.slice(i, i + 800).replace(/\n+/g, ' | ');
+    return txt.slice(i, i + 600).replace(/\n+/g, ' | ');
   });
   console.log('[exness] JOURNAL AFTER ORDER:', journalAfter);
+  console.log(`[exness] order result: confirmed=${confirmed} evidence=${evidence}`);
 
-  // 6) REAL confirmation: poll the Trade tab / journal for up to ~20s
-  let confirmed = false;
-  let evidence = '';
-  for (let i = 0; i < 12; i++) {
-    await sleep(1500);
-    const st = await page.evaluate((sym) => {
-      const t = document.body ? document.body.innerText : '';
-      if (/done!|request accepted|order (executed|placed|accepted|done)|position opened|deal done/i.test(t)) {
-        return { journal: true };
-      }
-      // Trade tab rows: pair + ticket number + volume
-      const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')].filter(r => r.offsetParent !== null);
-      for (const r of rows) {
-        const txt = (r.innerText || '');
-        if (txt.includes(sym) && /\d{4,}/.test(txt) && /(buy|sell)/i.test(txt)) {
-          return { row: txt.replace(/\s+/g, ' ').slice(0, 140) };
-        }
-      }
-      return null;
-    }, pair);
-    if (st) { confirmed = true; evidence = JSON.stringify(st); break; }
-  }
   await screenshot(page, 'after-order');
-  console.log(`[exness] order submitted, confirmed=${confirmed} evidence=${evidence}`);
+  if (!confirmed) {
+    throw new Error('Order ticket did not close / no position found after clicking ' + action +
+      '. Journal: ' + (journalAfter || '(empty)') + ' — see screenshot');
+  }
   return { action, pair, lot, sl, tp, confirmed, evidence };
 }
 
@@ -1034,7 +1068,7 @@ async function executeTrade(signal, timeoutMs = 180000) {
 }
 
 module.exports = {
-  executeTrade, loginPage, launchBrowser, applyStealth, DEFAULT_SELECTORS, loadSelectors, verifyPositionsLive,
+  executeTrade, loginPage, launchBrowser, applyStealth, DEFAULT_SELECTORS, loadSelectors, verifyPositionsLive, terminalSymbol,
   clickVisibleText, clearAndType, fieldForLabel, screenshot, sleep,
   isLoginDialogOpen, isTerminalVisible, waitForLoginDialog, clickSwitchModalIfVisible,
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
