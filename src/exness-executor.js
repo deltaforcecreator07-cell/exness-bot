@@ -111,13 +111,10 @@ async function clickVisibleText(page, wanted, timeout = 8000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const box = await page.evaluate((list) => {
-      const el = [...document.querySelectorAll('span, div, td, a, label, button')]
-        .filter((e) => e.offsetParent !== null && e.childElementCount === 0)
-        .find((e) => {
-          const txt = (e.innerText || '').trim().toLowerCase();
-          return list.some((w) => txt === w.toLowerCase() || txt.startsWith(w.toLowerCase() + ' '));
-        });
-      if (!el) return null;
+      const els = [...document.querySelectorAll('*')]
+        .filter((e) => e.offsetParent !== null && list.some((w) => (e.innerText || '').trim().toLowerCase() === w.toLowerCase()));
+      if (!els.length) return null;
+      const el = els[els.length - 1]; // innermost node
       const r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) return null;
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
@@ -603,18 +600,20 @@ async function revealHiddenSymbols(page, categoryName = 'Forex') {
   // 1. Find a reliable anchor in Market Watch to right-click
   const clickPos = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const elements = [...document.querySelectorAll('td, span, div, li')].filter((e) => vis(e) && e.childElementCount === 0);
+    // Bypassing childElementCount check, targeting the innermost elements
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
     
-    // Fallback 1: Look for any known standard default pair Exness always loads
-    const target = elements.find(e => /^(EURUSD|USDJPY|GBPUSD|USDCHF|USDCAD|AUDUSD)[a-z0-9]*$/i.test((e.innerText || '').trim()));
-    if (target) {
+    const targets = allEls.filter(e => /^(EURUSD|USDJPY|GBPUSD|USDCHF|USDCAD|AUDUSD)[a-z0-9]*$/i.test((e.innerText || '').trim()));
+    if (targets.length) {
+        const target = targets[targets.length - 1]; // get the innermost node
         const r = target.getBoundingClientRect();
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
     }
     
-    // Fallback 2: The "Symbol" column header (click just below it into the empty list area)
-    const header = elements.find(e => (e.innerText || '').trim() === 'Symbol');
-    if (header) {
+    // Fallback: click right under the "Symbol" header
+    const headers = allEls.filter(e => (e.innerText || '').trim() === 'Symbol');
+    if (headers.length) {
+        const header = headers[headers.length - 1];
         const r = header.getBoundingClientRect();
         return { x: r.x + 10, y: r.y + 35 };
     }
@@ -627,18 +626,19 @@ async function revealHiddenSymbols(page, categoryName = 'Forex') {
     return false;
   }
 
-  // Execute the right-click
   await page.mouse.click(clickPos.x, clickPos.y, { button: 'right' });
   await sleep(1200);
 
   // 2. Click "Symbols" in the context menu
   const symbolsMenuOption = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const opts = [...document.querySelectorAll('td, span, div, li, a')]
-      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === 'Symbols');
-      
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
+    
+    const opts = allEls.filter((e) => (e.innerText || '').trim() === 'Symbols');
     if (!opts.length) return null;
-    const r = opts[0].getBoundingClientRect();
+    
+    const opt = opts[opts.length - 1]; // innermost node
+    const r = opt.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
 
@@ -649,20 +649,21 @@ async function revealHiddenSymbols(page, categoryName = 'Forex') {
   }
   
   await page.mouse.click(symbolsMenuOption.x, symbolsMenuOption.y);
-  await sleep(1500); // Wait for the Symbols modal to pop up
+  await sleep(1500); 
 
   // 3. Find and click the specified category (e.g., "Forex" or "Metals")
   const clickedCat = await page.evaluate((cat) => {
     const vis = (el) => el.offsetParent !== null;
-    const modals = [...document.querySelectorAll('.page-window.modal')].filter(m => vis(m));
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
     const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
     if (!symbolsModal) return false;
 
-    const items = [...symbolsModal.querySelectorAll('td, span, div, li')]
-      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim().toLowerCase() === cat.toLowerCase());
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const items = allEls.filter((e) => (e.innerText || '').trim().toLowerCase() === cat.toLowerCase());
       
     if (!items.length) return false;
-    const r = items[0].getBoundingClientRect();
+    const item = items[items.length - 1]; // innermost node
+    const r = item.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   }, categoryName);
 
@@ -676,13 +677,15 @@ async function revealHiddenSymbols(page, categoryName = 'Forex') {
   // 4. Click "Show"
   const showBtn = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const modals = [...document.querySelectorAll('.page-window.modal')].filter(m => vis(m));
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
     const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
     if (!symbolsModal) return null;
     
-    const btn = [...symbolsModal.querySelectorAll('button')].find((b) => vis(b) && (b.innerText || '').trim() === 'Show');
-    if (!btn) return null;
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const buttons = allEls.filter((b) => (b.innerText || '').trim() === 'Show');
+    if (!buttons.length) return null;
     
+    const btn = buttons[buttons.length - 1]; // innermost node
     const r = btn.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
@@ -696,13 +699,15 @@ async function revealHiddenSymbols(page, categoryName = 'Forex') {
   // 5. Click "Close" to exit the modal
   const closeBtn = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const modals = [...document.querySelectorAll('.page-window.modal')].filter(m => vis(m));
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
     const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
     if (!symbolsModal) return null;
     
-    const btn = [...symbolsModal.querySelectorAll('button')].find((b) => vis(b) && (b.innerText || '').trim() === 'Close');
-    if (!btn) return null;
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const buttons = allEls.filter((b) => (b.innerText || '').trim() === 'Close');
+    if (!buttons.length) return null;
     
+    const btn = buttons[buttons.length - 1]; // innermost node
     const r = btn.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
@@ -729,17 +734,19 @@ async function openOrderTicket(page, candidates) {
   const foundBox = await page.evaluate((cands) => {
     const vis = (el) => el.offsetParent !== null;
     
-    const elements = [...document.querySelectorAll('td, span, div, li, a')]
-      .filter((e) => vis(e) && e.childElementCount === 0);
+    // Bypassing childElementCount check
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
       
     const upCands = cands.map((c) => String(c).toUpperCase());
     
-    let row = elements.find((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
-    if (!row) {
-        row = elements.find((e) => upCands.some((c) => (e.innerText || '').trim().toUpperCase().startsWith(c + ',')));
+    let matches = allEls.filter((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
+    if (!matches.length) {
+        matches = allEls.filter((e) => upCands.some((c) => (e.innerText || '').trim().toUpperCase().startsWith(c + ',')));
     }
 
-    if (!row) return null;
+    if (!matches.length) return null;
+    
+    const row = matches[matches.length - 1]; // Innermost element containing the text
     
     // Scroll into view so the headless mouse can physically reach it
     row.scrollIntoView({ block: 'center', behavior: 'instant' });
@@ -771,7 +778,6 @@ async function openOrderTicket(page, candidates) {
   
   console.log('[exness] Order ticket successfully opened and pre-filled via Market Watch double-click.');
 }
-
 
 async function placeOrder(page, sig) {
   const { action, lot, sl, tp } = sig;
