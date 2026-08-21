@@ -707,21 +707,57 @@ async function tryOpenNewOrderDialog(page, timeout = 5000) {
   return false;
 }
 
-/** Close the ticket if it's open (X button, else Escape). */
+/** Close the ticket if it's open. Tries the X button (by text/title first,
+ *  then by position — top-right corner of the modal header, since the icon
+ *  may be an SVG/icon-font glyph with no matching text), then Escape, then
+ *  verifies. NOTE: the ticket appears to be a non-blocking floating panel
+ *  (Market Watch stays fully visible/interactive behind it in the verified
+ *  recordings), so callers should NOT hard-depend on this succeeding. */
 async function closeOrderTicket(page) {
-  const closedByX = await page.evaluate(() => {
-    const vis = (el) => el.offsetParent !== null;
-    const modal = [...document.querySelectorAll('.page-window.modal')]
-      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
-    if (!modal) return true;
-    const x = [...modal.querySelectorAll('button, [role="button"], span, div')]
-      .filter(vis)
-      .find((b) => /^(x|\u00d7|close)$/i.test((b.innerText || '').trim()) || /close/i.test(b.title || ''));
-    if (x) { x.click(); return true; }
-    return false;
-  });
-  if (!closedByX) await page.keyboard.press('Escape').catch(() => {});
-  await sleep(500);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!(await isOrderTicketOpen(page))) return true;
+    const clickedX = await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      const modal = [...document.querySelectorAll('.page-window.modal')]
+        .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+      if (!modal) return true;
+      // 1) by text/title
+      let x = [...modal.querySelectorAll('button, [role="button"], span, div')]
+        .filter(vis)
+        .find((b) => /^(x|\u00d7|\u2715|\u2716|close)$/i.test((b.innerText || '').trim()) || /close/i.test(b.title || ''));
+      // 2) by position — small element in the top-right corner of the modal header
+      if (!x) {
+        const mr = modal.getBoundingClientRect();
+        x = [...modal.querySelectorAll('button, [role="button"], span, div')]
+          .filter(vis)
+          .map((el) => ({ el, r: el.getBoundingClientRect() }))
+          .filter(({ r }) => r.width <= 28 && r.height <= 28 && r.top - mr.top < 36 && mr.right - r.right < 40)
+          .sort((a, b) => (mr.right - a.r.right) - (mr.right - b.r.right))[0]?.el;
+      }
+      if (x) { x.click(); return true; }
+      return false;
+    });
+    if (!clickedX) await page.keyboard.press('Escape').catch(() => {});
+    await sleep(700);
+  }
+  const stillOpen = await isOrderTicketOpen(page);
+  if (stillOpen) console.warn('[exness] could not confirm the order ticket closed — proceeding anyway (it does not appear to block the rest of the UI)');
+  return !stillOpen;
+}
+
+/** Debug helper: dump short visible text strings from the Market Watch
+ *  column (left ~250px) so a failure is diagnosable from logs alone. */
+async function dumpMarketWatchText(page) {
+  try {
+    return await page.evaluate(() => {
+      const vis = (el) => el.offsetParent !== null;
+      return [...document.querySelectorAll('div, span, td, li')]
+        .filter((e) => vis(e) && e.childElementCount === 0)
+        .map((e) => ({ t: (e.innerText || '').trim(), r: e.getBoundingClientRect() }))
+        .filter((o) => o.t && o.t.length <= 20 && o.r.left < 250 && o.r.top < 650)
+        .map((o) => o.t);
+    });
+  } catch { return []; }
 }
 
 /**
@@ -755,23 +791,70 @@ async function setTicketSymbolSelect(page, candidates) {
   return res;
 }
 
-/** Fallback: add the symbol via Market Watch's "Forex" flyout (fixes two
- *  bugs from the previous version: the "Forex" label match no longer
- *  requires childElementCount===0 — it has a sibling arrow icon so that
- *  never matched — and the target row is scrolled into view before its
- *  coordinates are read, since this flyout has no search box). */
-async function pickSymbolFromMarketWatch(page, candidates) {
-  const forexBox = await page.evaluate(() => {
+/** If the Market Watch panel itself is collapsed/hidden, click its
+ *  "Symbols" tab (bottom-left of the terminal) to bring it back. */
+async function ensureMarketWatchVisible(page) {
+  const hasForexOrRows = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const el = [...document.querySelectorAll('div, span, td, li')]
+    return [...document.querySelectorAll('div, span, td, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .some((e) => /^(forex|metals|crypto|indices|stocks|commodities)$/i.test((e.innerText || '').trim()));
+  });
+  if (hasForexOrRows) return true;
+  const tabBox = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('div, span, td, li, button')]
       .filter(vis)
-      .find((e) => (e.innerText || '').trim() === 'Forex');
+      .find((e) => (e.innerText || '').trim() === 'Symbols');
     if (!el) return null;
     const r = el.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
-  if (!forexBox) throw new Error('Market Watch "Forex" category not found');
-  await page.mouse.click(forexBox.x, forexBox.y);
+  if (tabBox) {
+    await page.mouse.click(tabBox.x, tabBox.y);
+    await sleep(600);
+    return true;
+  }
+  return false;
+}
+
+/** Fallback: add the symbol via a Market Watch category flyout. Tries
+ *  several category names since brokers file Gold differently ("Forex",
+ *  "Metals", ...). Fixes from the previous version: the label match no
+ *  longer requires childElementCount===0 (a sibling arrow icon meant that
+ *  never matched some renders), the target row is scrolled into view before
+ *  its coordinates are read (no search box in this flyout), and on failure
+ *  we screenshot + dump the visible Market Watch text BEFORE throwing, so a
+ *  repeat failure is debuggable from logs without another recording. */
+async function pickSymbolFromMarketWatch(page, candidates) {
+  await ensureMarketWatchVisible(page);
+
+  const CATEGORY_NAMES = ['Forex', 'Metals', 'Commodities', 'Spot Metals', 'CFD'];
+  let categoryBox = null;
+  let categoryUsed = null;
+  for (let attempt = 0; attempt < 2 && !categoryBox; attempt++) {
+    if (attempt > 0) await sleep(1000); // second pass: give the panel a moment to settle
+    const found = await page.evaluate((names) => {
+      const vis = (el) => el.offsetParent !== null;
+      const rows = [...document.querySelectorAll('div, span, td, li')].filter(vis);
+      for (const name of names) {
+        const el = rows.find((e) => (e.innerText || '').trim().toLowerCase() === name.toLowerCase());
+        if (el) {
+          const r = el.getBoundingClientRect();
+          return { name, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+      }
+      return null;
+    }, CATEGORY_NAMES);
+    if (found) { categoryBox = found; categoryUsed = found.name; }
+  }
+  if (!categoryBox) {
+    const dump = await dumpMarketWatchText(page);
+    await screenshot(page, 'forex-category-not-found');
+    throw new Error('No Market Watch category (Forex/Metals/...) found. Visible Market Watch text: ' + JSON.stringify(dump).slice(0, 600) + ' — see screenshot.');
+  }
+  await page.mouse.click(categoryBox.x, categoryBox.y);
+  console.log(`[exness] opened Market Watch category "${categoryUsed}"`);
   await sleep(900);
 
   const foundText = await page.evaluate((cands) => {
@@ -814,8 +897,24 @@ async function openOrderTicket(page, candidates) {
   if (symRes.ok) return;
 
   console.warn(`[exness] symbol not directly selectable in ticket (${symRes.reason}) — adding it via Market Watch first`);
-  await closeOrderTicket(page);
-  await pickSymbolFromMarketWatch(page, candidates);
+  // Closing isn't strictly required (the ticket looks like a non-blocking
+  // floating panel in the verified recordings) — try, but don't depend on it.
+  await closeOrderTicket(page).catch((e) => console.warn('[exness] closeOrderTicket:', e.message));
+
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await pickSymbolFromMarketWatch(page, candidates);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[exness] Market Watch fallback attempt ${attempt + 1} failed: ${e.message}`);
+      await sleep(1200);
+    }
+  }
+  if (lastErr) throw lastErr;
+
   if (!(await tryOpenNewOrderDialog(page))) {
     await screenshot(page, 'no-order-ticket-after-watchlist');
     throw new Error('Could not open the New Order ticket after adding the symbol via Market Watch. See screenshot.');
