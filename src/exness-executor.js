@@ -651,14 +651,20 @@ async function focusTerminal(page) {
  *  Size range widened (was 16-42, now 12-44) — a real 1440x900 screenshot
  *  measured these icons at ~16-27px, right at the old lower boundary, which
  *  risked excluding them on sub-pixel rounding. */
+/** Small square icon-only buttons clustered top-left = the toolbar.
+ *  Sorted left-to-right: index 0 = "New Chart", index 1 = "New Order".
+ */
 async function toolbarIconButtons(page) {
   return page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     const all = [...document.querySelectorAll('button, [role="button"], div, td, a')]
       .filter(vis)
+      // THE FIX: Ignore any elements that contain text (like "File" or "View")
+      .filter((el) => (el.innerText || '').trim() === '')
       .map((el) => ({ r: el.getBoundingClientRect() }))
       .filter(({ r }) => r.width >= 12 && r.width <= 44 && r.height >= 12 && r.height <= 44 && r.top < 140 && r.left < 400)
       .sort((a, b) => a.r.left - b.r.left);
+      
     const out = [];
     for (const o of all) {
       const x = o.r.left + o.r.width / 2, y = o.r.top + o.r.height / 2;
