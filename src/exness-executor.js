@@ -35,6 +35,34 @@
  * once, later signals skip login; PUPPETEER_HEADLESS=shell uses the lighter
  * chrome-headless-shell.
  */
+/**
+ * ==== ADDITIONAL FINDINGS (2026-08-20, from a verified screen recording of ====
+ * ==== the real account placing a live Gold trade) ====
+ * 7. The floating "Order" ticket (Symbol / Volume / Stop Loss / Take Profit /
+ *    Comment / Type / "Sell by Market" | "Buy by Market") is opened by the
+ *    2ND TOOLBAR ICON (top-left, "New Order" — a white page + green plus,
+ *    right next to the "New Chart" icon) or by the F9 hotkey. It is NOT
+ *    reached by first clicking "Create a new chart" and hunting for an
+ *    inline per-chart "Forex" dropdown — that earlier assumption was wrong
+ *    and is why symbol selection kept failing ("symbol row not found").
+ * 8. The ticket's "Symbol:" field is a REAL native <select> (GWT ListBox),
+ *    with options formatted "SYMBOL, Description" (e.g. "XAUUSD, Gold vs US
+ *    Dollar"). Set it directly via `select.value = ...` + a 'change' event —
+ *    no typing into it, no clicking a filtered dropdown row, no Escape dance.
+ * 9. On this account BOTH "XAUUSD" (regular gold) and "XAUUSD247" (24/7
+ *    variant) exist as separate symbols — verified side-by-side in the
+ *    Market Watch "Forex" flyout. The recording used plain "XAUUSD". The
+ *    old hardcoded alias XAUUSD -> "XAUUSD247" was therefore searching for a
+ *    symbol string that may not even be the one you want; the new code
+ *    tries "XAUUSD" first and falls back through a candidate list instead of
+ *    hardcoding one guess.
+ * 10. Market Watch's "Forex" category (left sidebar) is a flyout of 200+
+ *     symbols, alphabetical, with NO search/filter box — you must scroll.
+ *     Gold sits near the very end (next to Silver/XAG and Platinum/XPT,
+ *     just before the exotic "Z..." pairs). This is only needed as a
+ *     fallback now, to add a symbol to Market Watch if it isn't already
+ *     selectable in the ticket's Symbol <select>.
+ */
 
 const fs = require('fs');
 const path = require('path');
@@ -596,59 +624,16 @@ async function isOrderTicketOpen(page) {
     return /Volume|Stop Loss|Take Profit/i.test(t);
   });
 }
-
 /**
- * Open the order ticket for a symbol. GWT needs REAL mouse events, so we use
- * page.mouse (coordinate clicks), not synthetic dispatchEvent.
- *  1) click the chart to focus the terminal, then F9
- *  2) Market Watch search: click the search box, type the symbol, double-click
- *     the filtered row (opens the ticket for that symbol)
- *  3) toolbar "New Order" button
- *  4) right-click a Market Watch row -> "New Order" context menu
- * If all fail, dumps the terminal UI so we can adapt.
+ * Open the order ticket for a symbol.
+ * REWRITTEN (see header notes 7-10): open the "New Order" ticket first
+ * (this doesn't depend on which symbol is currently charted), then set the
+ * Symbol field directly via its native <select>. Only if that symbol isn't
+ * present as a selectable option do we fall back to Market Watch's "Forex"
+ * flyout to add it, then reopen the ticket.
  */
-/**
- * Open the order ticket for a symbol following the REAL terminal flow
- * (from the account owner's inspection):
- *  1) click "Create a new chart"  (first toolbar button) -> opens a chart tab
- *  2) in the chart, click the symbol dropdown ("Forex") -> opens the pair list
- *  3) type the symbol to filter, then click the Gold row (XAUUSD247, 24/7)
- *     -> the chart now shows that symbol
- *  4) click "Create new order" (the second toolbar button) -> order ticket
- *     for THAT symbol (no symbol-field fiddling needed)
- */
-async function openOrderTicket(page, pair) {
-  const tryWaitTicket = async (how) => {
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
-      if (await isOrderTicketOpen(page)) { console.log(`[exness] order ticket opened (${how})`); return true; }
-      await sleep(1000);
-    }
-    return false;
-  };
 
-  // helper: click the first visible element whose text/title matches
-  const clickText = async (re) => {
-    const box = await page.evaluate((rx) => {
-      const vis = (el) => el.offsetParent !== null;
-      const el = [...document.querySelectorAll('button, [role="button"], div, span, a, li, td')]
-        .filter(e => vis(e) && e.childElementCount === 0)
-        .find(e => new RegExp(rx, 'i').test((e.innerText || '').trim()) ||
-                   new RegExp(rx, 'i').test((e.title || '')));
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || el.title || '').trim().slice(0, 40) };
-    }, re);
-    if (box) {
-      await page.mouse.click(box.x, box.y);
-      await sleep(800);
-      console.log(`[exness] clicked: "${box.text}"`);
-      return true;
-    }
-    return false;
-  };
-
-  // 0) focus the terminal
+async function focusTerminal(page) {
   try {
     const cb = await page.evaluate(() => {
       const c = document.querySelector('canvas');
@@ -658,239 +643,250 @@ async function openOrderTicket(page, pair) {
     });
     if (cb) await page.mouse.click(cb.x, cb.y);
   } catch {}
-  await sleep(500);
+  await sleep(300);
+}
 
-  // 1) "Create a new chart" (first button) — opens a fresh chart tab
-  const chartClicked = await clickText('^New Chart$|Create a new chart|New Chart');
-  if (!chartClicked) {
-    // fallback: maybe a chart tab already exists; try F9
-    await page.keyboard.press('F9').catch(() => {});
-  }
-  await sleep(2000);
-
-  // 2) click the chart's symbol dropdown ("Forex" header / dropdown)
-  const dropdownClicked = await clickText('^Forex$|Forex \\u25bc|Forex \\u25be|^Forex:?$');
-  if (!dropdownClicked) {
-    // fallback: click the symbol combo in the chart toolbar (shows current symbol)
-    await clickText('USDCHF|EURUSD|GBPUSD|XAUUSD');
-  }
-  await sleep(2000);
-
-  // 3) type the symbol to filter the list, then click the Gold row
-  const typed = await page.evaluate((sym) => {
+/** Small square icon-only buttons clustered top-left = the toolbar.
+ *  Sorted left-to-right: index 0 = "New Chart", index 1 = "New Order". */
+async function toolbarIconButtons(page) {
+  return page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const input = [...document.querySelectorAll('input')]
+    const all = [...document.querySelectorAll('button, [role="button"], div, td, a')]
       .filter(vis)
-      .find(i => /symbol|search/i.test((i.id || '') + (i.name || '') + (i.placeholder || ''))) || null;
-    if (input) {
-      const proto = window.HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, sym);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.focus();
+      .map((el) => ({ r: el.getBoundingClientRect() }))
+      .filter(({ r }) => r.width >= 16 && r.width <= 42 && r.height >= 16 && r.height <= 42 && r.top < 140 && r.left < 400)
+      .sort((a, b) => a.r.left - b.r.left);
+    const out = [];
+    for (const o of all) {
+      const x = o.r.left + o.r.width / 2, y = o.r.top + o.r.height / 2;
+      if (!out.some((p) => Math.abs(p.x - x) < 4 && Math.abs(p.y - y) < 4)) out.push({ x, y });
+    }
+    return out;
+  });
+}
+
+/** Try every known way to open the New Order ticket; true once it's open. */
+async function tryOpenNewOrderDialog(page, timeout = 5000) {
+  if (await isOrderTicketOpen(page)) return true;
+  await focusTerminal(page);
+
+  // 1) F9 — the standard MetaTrader "New Order" hotkey
+  await page.keyboard.press('F9').catch(() => {});
+  if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after F9').catch(() => false)) {
+    console.log('[exness] order ticket opened (F9)');
+    return true;
+  }
+
+  // 2) toolbar icon #2 ("New Order", next to "New Chart")
+  const icons = await toolbarIconButtons(page);
+  if (icons[1]) {
+    await page.mouse.click(icons[1].x, icons[1].y);
+    if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after toolbar click').catch(() => false)) {
+      console.log('[exness] order ticket opened (toolbar icon #2)');
       return true;
     }
-    return false;
-  }, pair);
-  if (!typed) {
-    // type into whatever is focused after opening the dropdown
-    await page.keyboard.type(pair, { delay: 60 });
   }
-  await sleep(1800);
 
-  const goldClicked = await page.evaluate((sym) => {
+  // 3) any visible element whose text/title mentions "New Order"
+  const clicked = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const el = [...document.querySelectorAll('td, span, div, li, tr')]
-      .filter(e => vis(e) && e.childElementCount === 0)
-      .find(e => {
-        const t = (e.innerText || '').trim().toUpperCase();
-        return t.startsWith(sym.toUpperCase() + ',') || t === sym.toUpperCase();
-      });
-    if (!el) return null;
+    const el = [...document.querySelectorAll('button, [role="button"], div, span, a, li, td')]
+      .filter(vis)
+      .find((e) => /new order|create new order/i.test((e.innerText || '').trim()) || /new order|create new order/i.test(e.title || ''));
+    if (!el) return false;
     const r = el.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 40) };
-  }, pair);
-  if (goldClicked) {
-    await page.mouse.click(goldClicked.x, goldClicked.y);
-    console.log('[exness] clicked symbol row:', goldClicked.text);
-  } else {
-    // fallback: press Enter to select the highlighted filtered row
-    await page.keyboard.press('Enter');
-    console.log('[exness] symbol row not found by text — pressed Enter on filtered list');
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (clicked) {
+    await page.mouse.click(clicked.x, clicked.y);
+    if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after text match').catch(() => false)) {
+      console.log('[exness] order ticket opened (text/title match)');
+      return true;
+    }
   }
-  await sleep(2500);
+  return false;
+}
 
-  // 4) "Create new order" (second toolbar button) -> ticket for the chart's symbol
-  const orderClicked = await clickText('^New Order$|Create new order|New Order');
-  if (orderClicked && await tryWaitTicket('Create new order')) return;
-
-  // fallbacks if the chart-flow didn't yield a ticket
-  await page.keyboard.press('F9').catch(() => {});
-  if (await tryWaitTicket('F9')) return;
-  await clickText('^New Order$|Create new order');
-  if (await tryWaitTicket('New Order')) return;
-
-  const dump = await page.evaluate(() => ({
-    toolbar: [...document.querySelectorAll('button, [role="button"], [title]')]
-      .filter(b => b.offsetParent !== null)
-      .map(b => ({ t: (b.innerText || b.title || b.getAttribute('aria-label') || '').trim().slice(0, 40) }))
-      .filter(x => x.t)
-      .slice(0, 30),
-    texts: [...new Set(
-      [...document.querySelectorAll('td, span, div')]
-        .filter(e => e.offsetParent !== null && e.childElementCount === 0)
-        .map(e => (e.innerText || '').trim())
-        .filter(t => t && t.length < 50)
-    )].slice(0, 40),
-  }));
-  console.log('[exness] terminal dump (no ticket):', JSON.stringify(dump));
-  await screenshot(page, 'no-order-ticket');
-  throw new Error('Could not open the order ticket via Create-new-chart flow. See screenshot + terminal dump.');
+/** Close the ticket if it's open (X button, else Escape). */
+async function closeOrderTicket(page) {
+  const closedByX = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    if (!modal) return true;
+    const x = [...modal.querySelectorAll('button, [role="button"], span, div')]
+      .filter(vis)
+      .find((b) => /^(x|\u00d7|close)$/i.test((b.innerText || '').trim()) || /close/i.test(b.title || ''));
+    if (x) { x.click(); return true; }
+    return false;
+  });
+  if (!closedByX) await page.keyboard.press('Escape').catch(() => {});
+  await sleep(500);
 }
 
 /**
- * Map a logical pair (XAUUSD from the parser) to the account's REAL terminal
- * symbol. Your Exness MT4 account lists gold as "XAUUSD247, Gold vs US Dollar
- * 24/7" — plain XAUUSD doesn't exist in the dropdown, which is why the symbol
- * never changed and orders silently failed. Override via SYMBOL_ALIASES env.
+ * Set the ticket's Symbol field. VERIFIED: it's a real native <select>
+ * (options formatted "SYMBOL, Description") — set .value + fire 'change'.
+ * `candidates` is an ordered list of acceptable terminal symbol names; the
+ * first one that exists as an option wins.
+ */
+async function setTicketSymbolSelect(page, candidates) {
+  const res = await page.evaluate((cands) => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    const scope = modal || document;
+    const selects = [...scope.querySelectorAll('select')].filter(vis);
+    if (!selects.length) return { ok: false, reason: 'no-select' };
+    const symSelect = selects[0]; // Symbol is the first select in the ticket; Type is the second
+    const opts = [...symSelect.options];
+    const upCands = cands.map((c) => String(c).toUpperCase());
+    let match = opts.find((o) => upCands.includes((o.value || '').toUpperCase()) || upCands.includes((o.text || '').toUpperCase()));
+    if (!match) {
+      match = opts.find((o) => upCands.some((c) => (o.value || '').toUpperCase().startsWith(c) || (o.text || '').toUpperCase().startsWith(c + ',')));
+    }
+    if (!match) return { ok: false, reason: 'no-match', sampleOptions: opts.slice(0, 400).map((o) => o.text || o.value) };
+    symSelect.value = match.value;
+    symSelect.dispatchEvent(new Event('input', { bubbles: true }));
+    symSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, matched: match.text || match.value };
+  }, candidates);
+  if (res.ok) console.log('[exness] symbol select set ->', res.matched);
+  return res;
+}
+
+/** Fallback: add the symbol via Market Watch's "Forex" flyout (fixes two
+ *  bugs from the previous version: the "Forex" label match no longer
+ *  requires childElementCount===0 — it has a sibling arrow icon so that
+ *  never matched — and the target row is scrolled into view before its
+ *  coordinates are read, since this flyout has no search box). */
+async function pickSymbolFromMarketWatch(page, candidates) {
+  const forexBox = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('div, span, td, li')]
+      .filter(vis)
+      .find((e) => (e.innerText || '').trim() === 'Forex');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (!forexBox) throw new Error('Market Watch "Forex" category not found');
+  await page.mouse.click(forexBox.x, forexBox.y);
+  await sleep(900);
+
+  const foundText = await page.evaluate((cands) => {
+    const vis = (el) => el.offsetParent !== null;
+    const rows = [...document.querySelectorAll('td, span, div, li')].filter((e) => vis(e) && e.childElementCount === 0);
+    const upCands = cands.map((c) => String(c).toUpperCase());
+    let row = rows.find((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
+    if (!row) row = rows.find((e) => upCands.some((c) => (e.innerText || '').trim().toUpperCase().startsWith(c + ',')));
+    if (!row) return null;
+    row.scrollIntoView({ block: 'center' });
+    return (row.innerText || '').trim();
+  }, candidates);
+  if (!foundText) {
+    await screenshot(page, 'forex-flyout-no-match');
+    throw new Error('Symbol not found in the Market Watch Forex flyout (see screenshot)');
+  }
+  await sleep(400);
+  const box = await page.evaluate((wanted) => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('td, span, div, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .find((e) => (e.innerText || '').trim() === wanted);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, foundText);
+  if (!box) throw new Error(`"${foundText}" scrolled into view but has no clickable box`);
+  await page.mouse.click(box.x, box.y);
+  console.log('[exness] picked from Market Watch:', foundText);
+  await sleep(1500);
+}
+
+async function openOrderTicket(page, candidates) {
+  if (!(await tryOpenNewOrderDialog(page))) {
+    await screenshot(page, 'no-order-ticket');
+    throw new Error('Could not open the New Order ticket (tried F9, toolbar icon, and text match). See screenshot.');
+  }
+  let symRes = await setTicketSymbolSelect(page, candidates);
+  if (symRes.ok) return;
+
+  console.warn(`[exness] symbol not directly selectable in ticket (${symRes.reason}) — adding it via Market Watch first`);
+  await closeOrderTicket(page);
+  await pickSymbolFromMarketWatch(page, candidates);
+  if (!(await tryOpenNewOrderDialog(page))) {
+    await screenshot(page, 'no-order-ticket-after-watchlist');
+    throw new Error('Could not open the New Order ticket after adding the symbol via Market Watch. See screenshot.');
+  }
+  symRes = await setTicketSymbolSelect(page, candidates);
+  if (!symRes.ok) {
+    await screenshot(page, 'symbol-not-in-select');
+    throw new Error(`Symbol still not selectable after the Market Watch fallback (${symRes.reason}). Sample options: ` +
+      JSON.stringify(symRes.sampleOptions || []).slice(0, 500) + ' — see screenshot.');
+  }
+}
+
+/**
+ * Map a logical pair (XAUUSD from the parser) to REAL terminal symbol name(s).
+ * VERIFIED (2026-08-20): this account lists BOTH "XAUUSD" and "XAUUSD247" as
+ * separate symbols. Plain "XAUUSD" is what the verified recording actually
+ * used, so it's now tried FIRST instead of being hardcoded to "XAUUSD247".
+ * Override via SYMBOL_ALIASES env (JSON, e.g. {"XAUUSD":"XAUUSDm"}).
  */
 function symbolAliases() {
-  try {
-    return { XAUUSD: 'XAUUSD247', GOLD: 'XAUUSD247', ...JSON.parse(process.env.SYMBOL_ALIASES || '{}') };
-  } catch {
-    return { XAUUSD: 'XAUUSD247', GOLD: 'XAUUSD247' };
-  }
+  try { return { ...JSON.parse(process.env.SYMBOL_ALIASES || '{}') }; } catch { return {}; }
 }
 function terminalSymbol(pair) {
   const a = symbolAliases();
-  return a[pair] || a[pair?.toUpperCase()] || pair;
+  const p = String(pair || '').toUpperCase();
+  return a[pair] || a[p] || (p === 'GOLD' ? 'XAUUSD' : pair);
+}
+/** Ordered candidates to try against the ticket's live Symbol <select>. */
+function terminalSymbolCandidates(pair) {
+  const a = symbolAliases();
+  const p = String(pair || '').toUpperCase();
+  const override = a[pair] || a[p];
+  const out = [];
+  if (override) out.push(override);
+  if (p === 'XAUUSD' || p === 'GOLD') out.push('XAUUSD', 'XAUUSD247', 'XAUUSDm', 'GOLD');
+  else out.push(pair, pair + 'm', pair + '247');
+  return [...new Set(out)];
 }
 
 async function placeOrder(page, sig) {
   const { action, lot, sl, tp } = sig;
-  const pair = terminalSymbol(sig.pair); // XAUUSD -> XAUUSD247 for this account
+  const candidates = terminalSymbolCandidates(sig.pair);
+  const pair = candidates[0]; // logical/display name used below for journal matching
 
   // 0) sanity: if the login dialog is somehow still open, stop
   if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
 
-  // 1) open the order ticket
-  await openOrderTicket(page, pair);
+  // 1) open the order ticket AND get the right symbol selected in it
+  await openOrderTicket(page, candidates);
   await screenshot(page, 'order-ticket');
 
-  // 2) set the SYMBOL. The symbol combo options read "XAUUSD, Gold vs US Dollar"
-  //    (symbol + description), so match by PREFIX. After picking, the dropdown
-  //    must CLOSE — if it stays open it blocks the Buy/Sell click (that was
-  //    the real reason orders never placed).
-  const symbolSet = await page.evaluate((sym) => {
-    const vis = (el) => el.offsetParent !== null;
-    const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
-    const scope = modal || document;
-    const inputs = [...scope.querySelectorAll('input')].filter(vis);
-    const volIdx = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
-    const symInput = volIdx > 0 ? inputs[volIdx - 1] : (inputs[0] || null);
-    if (!symInput) return false;
-    const proto = window.HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(proto, 'value').set.call(symInput, sym);
-    symInput.dispatchEvent(new Event('input', { bubbles: true }));
-    symInput.dispatchEvent(new Event('change', { bubbles: true }));
-    symInput.focus();
-    return true;
-  }, pair);
-  if (symbolSet) {
-    await sleep(800);
-    // Find the dropdown item by its VISIBLE TEXT anywhere in the ticket modal
-    // (GWT combo items may not have class "option" — the earlier selector
-    //  missed them, so the dropdown never closed and blocked the Buy click).
-    const optBox = await page.evaluate((sym) => {
-      const vis = (el) => el.offsetParent !== null;
-      const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
-      const scope = modal || document;
-      const el = [...scope.querySelectorAll('td, span, div, li, a, label, button')]
-        .filter(e => vis(e) && e.childElementCount === 0)
-        .find(e => {
-          const t = (e.innerText || '').trim();
-          return t.toUpperCase().startsWith(sym.toUpperCase() + ',') ||
-                 t.toUpperCase() === sym.toUpperCase();
-        });
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 40) };
-    }, pair);
-    if (optBox) {
-      await page.mouse.click(optBox.x, optBox.y);
-      console.log('[exness] clicked dropdown item:', optBox.text);
-    } else {
-      // fallback: GWT combo keyboard selection — Down arrow highlights the
-      // filtered item, Enter commits and closes the dropdown
-      await page.keyboard.press('ArrowDown');
-      await sleep(300);
-      await page.keyboard.press('Enter');
-      console.log('[exness] no text match, used ArrowDown+Enter');
-    }
-    await sleep(1500);
-
-    // VERIFY the dropdown actually closed: the symbol description text
-    // ("Gold vs US Dollar") must NOT be visible anymore outside the input.
-    const dlg = await page.evaluate((sym) => {
-      const vis = (el) => el.offsetParent !== null;
-      const modal = [...document.querySelectorAll('.page-window.modal')].find(x => !/hidden/.test(x.className || ''));
-      const scope = modal || document;
-      const inputs = [...scope.querySelectorAll('input')].filter(vis);
-      const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
-      const si = vi > 0 ? vi - 1 : 0;
-      const val = inputs[si] ? inputs[si].value : '?';
-      // dropdown open = any visible leaf text mentions the symbol description
-      const desc = sym === 'XAUUSD247' ? /gold vs us dollar|gold vs usd/i :
-        new RegExp(sym + '\\s*,', 'i');
-      const dropdownOpen = [...scope.querySelectorAll('td, span, div, li')]
-        .some(e => vis(e) && e.childElementCount === 0 && desc.test((e.innerText || '').trim()));
-      return { val, dropdownOpen };
-    }, pair);
-    console.log(`[exness] symbol after select: "${dlg.val}" (want ${pair}) dropdownOpen=${dlg.dropdownOpen}`);
-    if (dlg.val.toUpperCase() !== pair.toUpperCase()) {
-      await screenshot(page, 'symbol-not-set');
-      throw new Error('Symbol did not change to ' + pair + ' in the ticket. See screenshot.');
-    }
-    if (dlg.dropdownOpen) {
-      // the dropdown is still covering the ticket — press Escape to dismiss
-      await page.keyboard.press('Escape');
-      await sleep(1000);
-      const stillOpen = await page.evaluate(() => {
-        const vis = (el) => el.offsetParent !== null;
-        return [...document.querySelectorAll('td, span, div, li')]
-          .some(e => vis(e) && e.childElementCount === 0 && /gold vs us dollar/i.test((e.innerText || '').trim()));
-      });
-      console.log('[exness] after Escape, dropdown still open:', stillOpen);
-      if (stillOpen) {
-        await screenshot(page, 'dropdown-stuck');
-        throw new Error('Symbol dropdown would not close (Escape failed) — it blocks the Buy button. See screenshot.');
-      }
-    }
-  } else {
-    console.warn('[exness] no symbol field in ticket — will use the ticket default (check screenshot)');
-  }
-
-  // 3) volume / SL / TP — use their input IDs directly. GWT labels are
-  //    absolutely positioned (no row structure), so label-scoping grabs the
-  //    WRONG inputs (that's how the TP value ended up in the Volume field).
-  const setInput = async (id, value) => {
-    const el = await page.$('#' + id);
+  // 2) volume / SL / TP — direct IDs first (verified), label lookup as fallback
+  const setInput = async (id, label, value) => {
+    let el = await page.$('#' + id);
     if (!el) {
-      console.warn('[exness] input#' + id + ' not found');
-      return false;
+      const handle = await fieldForLabel(page, label);
+      el = handle ? handle.asElement() : null;
     }
+    if (!el) { console.warn(`[exness] input for "${label}" (#${id}) not found`); return false; }
     await clearAndType(page, el, String(value));
-    console.log('[exness] set #' + id + ' = ' + String(value));
+    console.log(`[exness] set ${label} = ${value}`);
     return true;
   };
-  await setInput('volume', lot);
-  if (sl != null) await setInput('sl', sl);
-  if (tp != null) await setInput('tp', tp);
+  await setInput('volume', 'Volume', lot);
+  if (sl != null) await setInput('sl', 'Stop Loss', sl);
+  if (tp != null) await setInput('tp', 'Take Profit', tp);
   await sleep(1000);
 
-  // 4) verify the ticket is submittable BEFORE clicking — scoped to the modal,
+  // 3) verify the ticket is submittable BEFORE clicking — scoped to the modal,
   //    and check the VALUES actually landed in volume/sl/tp (not just present).
-  const ticketOk = await page.evaluate((act, exp) => {
+  const ticketOk = await page.evaluate((act) => {
     const vis = (el) => el.offsetParent !== null;
     const modal = [...document.querySelectorAll('.page-window.modal')]
       .find(m => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
@@ -905,6 +901,7 @@ async function placeOrder(page, sig) {
       const el = scope.querySelector('input#' + id);
       return el ? el.value : null;
     };
+    const sel = [...scope.querySelectorAll('select')].filter(vis)[0];
     return {
       ok: !!btn && !btn.disabled,
       btnFound: !!btn,
@@ -914,14 +911,9 @@ async function placeOrder(page, sig) {
       volume: val('volume'),
       sl: val('sl'),
       tp: val('tp'),
-      symbolInput: (() => {
-        const inputs = [...scope.querySelectorAll('input')].filter(vis);
-        const vi = inputs.findIndex(i => (i.id || '').toLowerCase() === 'volume');
-        const si = vi > 0 ? vi - 1 : -1;
-        return si >= 0 ? inputs[si].value : null;
-      })(),
+      symbolInput: sel ? (sel.options[sel.selectedIndex] ? (sel.options[sel.selectedIndex].text || sel.value) : sel.value) : null,
     };
-  }, action, { v: String(lot), s: String(sl ?? ''), t: String(tp ?? '') });
+  }, action);
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
   if (!ticketOk.ok || !ticketOk.modalFound || ticketOk.volume !== String(lot)) {
     console.warn(`[exness] ticket not ready: btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume="${ticketOk.volume}" (want "${lot}") sl="${ticketOk.sl}" tp="${ticketOk.tp}" symbol="${ticketOk.symbolInput}"`);
@@ -1147,4 +1139,8 @@ module.exports = {
   clickVisibleText, clearAndType, fieldForLabel, screenshot, sleep,
   isLoginDialogOpen, isTerminalVisible, waitForLoginDialog, clickSwitchModalIfVisible,
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
+  // new in this version (see header notes 7-10)
+  terminalSymbolCandidates, tryOpenNewOrderDialog, setTicketSymbolSelect,
+  pickSymbolFromMarketWatch, openOrderTicket, closeOrderTicket, toolbarIconButtons,
+  isOrderTicketOpen, focusTerminal,
 };
