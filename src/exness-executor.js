@@ -647,14 +647,17 @@ async function focusTerminal(page) {
 }
 
 /** Small square icon-only buttons clustered top-left = the toolbar.
- *  Sorted left-to-right: index 0 = "New Chart", index 1 = "New Order". */
+ *  Sorted left-to-right: index 0 = "New Chart", index 1 = "New Order".
+ *  Size range widened (was 16-42, now 12-44) — a real 1440x900 screenshot
+ *  measured these icons at ~16-27px, right at the old lower boundary, which
+ *  risked excluding them on sub-pixel rounding. */
 async function toolbarIconButtons(page) {
   return page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     const all = [...document.querySelectorAll('button, [role="button"], div, td, a')]
       .filter(vis)
       .map((el) => ({ r: el.getBoundingClientRect() }))
-      .filter(({ r }) => r.width >= 16 && r.width <= 42 && r.height >= 16 && r.height <= 42 && r.top < 140 && r.left < 400)
+      .filter(({ r }) => r.width >= 12 && r.width <= 44 && r.height >= 12 && r.height <= 44 && r.top < 140 && r.left < 400)
       .sort((a, b) => a.r.left - b.r.left);
     const out = [];
     for (const o of all) {
@@ -665,29 +668,21 @@ async function toolbarIconButtons(page) {
   });
 }
 
-/** Try every known way to open the New Order ticket; true once it's open. */
+/**
+ * Try every known way to open the New Order ticket; true once it's open.
+ * ORDER CHANGED (2026-08-21, after two live runs): the text/title match
+ * (tier 3) has been the only one that actually worked on two consecutive
+ * live runs — F9 and the position-based toolbar click both silently failed
+ * both times. Promoted it to run first so we're not burning ~10s on two
+ * dead ends every single trade. F9 and the toolbar click are kept as
+ * fallbacks in case a future account/skin behaves differently.
+ */
 async function tryOpenNewOrderDialog(page, timeout = 5000) {
   if (await isOrderTicketOpen(page)) return true;
   await focusTerminal(page);
 
-  // 1) F9 — the standard MetaTrader "New Order" hotkey
-  await page.keyboard.press('F9').catch(() => {});
-  if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after F9').catch(() => false)) {
-    console.log('[exness] order ticket opened (F9)');
-    return true;
-  }
-
-  // 2) toolbar icon #2 ("New Order", next to "New Chart")
-  const icons = await toolbarIconButtons(page);
-  if (icons[1]) {
-    await page.mouse.click(icons[1].x, icons[1].y);
-    if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after toolbar click').catch(() => false)) {
-      console.log('[exness] order ticket opened (toolbar icon #2)');
-      return true;
-    }
-  }
-
-  // 3) any visible element whose text/title mentions "New Order"
+  // 1) any visible element whose text/title mentions "New Order" — most
+  //    reliable so far.
   const clicked = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     const el = [...document.querySelectorAll('button, [role="button"], div, span, a, li, td')]
@@ -701,6 +696,23 @@ async function tryOpenNewOrderDialog(page, timeout = 5000) {
     await page.mouse.click(clicked.x, clicked.y);
     if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after text match').catch(() => false)) {
       console.log('[exness] order ticket opened (text/title match)');
+      return true;
+    }
+  }
+
+  // 2) F9 — the standard MetaTrader "New Order" hotkey
+  await page.keyboard.press('F9').catch(() => {});
+  if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after F9').catch(() => false)) {
+    console.log('[exness] order ticket opened (F9)');
+    return true;
+  }
+
+  // 3) toolbar icon #2 ("New Order", next to "New Chart")
+  const icons = await toolbarIconButtons(page);
+  if (icons[1]) {
+    await page.mouse.click(icons[1].x, icons[1].y);
+    if (await waitFor(page, () => isOrderTicketOpen(page), timeout, 'ticket after toolbar click').catch(() => false)) {
+      console.log('[exness] order ticket opened (toolbar icon #2)');
       return true;
     }
   }
@@ -794,13 +806,13 @@ async function setTicketSymbolSelect(page, candidates) {
 /** If the Market Watch panel itself is collapsed/hidden, click its
  *  "Symbols" tab (bottom-left of the terminal) to bring it back. */
 async function ensureMarketWatchVisible(page) {
-  const hasForexOrRows = await page.evaluate(() => {
+  const hasRows = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     return [...document.querySelectorAll('div, span, td, li')]
       .filter((e) => vis(e) && e.childElementCount === 0)
-      .some((e) => /^(forex|metals|crypto|indices|stocks|commodities)$/i.test((e.innerText || '').trim()));
+      .some((e) => /^[A-Z]{6}$/.test((e.innerText || '').trim())); // e.g. USDCHF
   });
-  if (hasForexOrRows) return true;
+  if (hasRows) return true;
   const tabBox = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     const el = [...document.querySelectorAll('div, span, td, li, button')]
@@ -818,43 +830,70 @@ async function ensureMarketWatchVisible(page) {
   return false;
 }
 
-/** Fallback: add the symbol via a Market Watch category flyout. Tries
- *  several category names since brokers file Gold differently ("Forex",
- *  "Metals", ...). Fixes from the previous version: the label match no
- *  longer requires childElementCount===0 (a sibling arrow icon meant that
- *  never matched some renders), the target row is scrolled into view before
- *  its coordinates are read (no search box in this flyout), and on failure
- *  we screenshot + dump the visible Market Watch text BEFORE throwing, so a
- *  repeat failure is debuggable from logs without another recording. */
+const CATEGORY_NAMES = ['Forex', 'Metals', 'Commodities', 'Spot Metals', 'CFD', 'Crypto', 'Indices'];
+
+/** Find a visible category node (Forex/Metals/...) anywhere on the page. */
+async function findCategoryBox(page) {
+  return page.evaluate((names) => {
+    const vis = (el) => el.offsetParent !== null;
+    const rows = [...document.querySelectorAll('div, span, td, li')].filter(vis);
+    for (const name of names) {
+      const el = rows.find((e) => (e.innerText || '').trim().toLowerCase() === name.toLowerCase());
+      if (el) {
+        const r = el.getBoundingClientRect();
+        return { name, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      }
+    }
+    return null;
+  }, CATEGORY_NAMES);
+}
+
+/**
+ * Fallback: add the symbol via the symbol-category flyout (Forex/Metals/...).
+ * VERIFIED from the FIRST recording (and now confirmed by a real 1440x900
+ * screenshot of a failed run — see chat): this category list is NOT a
+ * permanent part of Market Watch. It only appears after clicking the
+ * "New Chart" toolbar icon (the leftmost one) — that's a "pick a symbol for
+ * the new chart" menu, not a Market Watch feature. A fresh terminal session
+ * where Market Watch only ever shows its ~20 default favorites (exactly what
+ * the failing screenshot showed) will never have a "Forex" row until that
+ * button is clicked first. This function now does that unconditionally
+ * before searching, and also tries several category names since Gold may be
+ * filed under "Metals" rather than "Forex" depending on the account.
+ */
 async function pickSymbolFromMarketWatch(page, candidates) {
   await ensureMarketWatchVisible(page);
 
-  const CATEGORY_NAMES = ['Forex', 'Metals', 'Commodities', 'Spot Metals', 'CFD'];
-  let categoryBox = null;
-  let categoryUsed = null;
-  for (let attempt = 0; attempt < 2 && !categoryBox; attempt++) {
-    if (attempt > 0) await sleep(1000); // second pass: give the panel a moment to settle
-    const found = await page.evaluate((names) => {
-      const vis = (el) => el.offsetParent !== null;
-      const rows = [...document.querySelectorAll('div, span, td, li')].filter(vis);
-      for (const name of names) {
-        const el = rows.find((e) => (e.innerText || '').trim().toLowerCase() === name.toLowerCase());
-        if (el) {
-          const r = el.getBoundingClientRect();
-          return { name, x: r.x + r.width / 2, y: r.y + r.height / 2 };
-        }
-      }
-      return null;
-    }, CATEGORY_NAMES);
-    if (found) { categoryBox = found; categoryUsed = found.name; }
+  // Some sessions may already show a category row (seen once before) — check
+  // first, but don't rely on it; otherwise open it via "New Chart".
+  let categoryBox = await findCategoryBox(page);
+  let openedViaNewChart = false;
+  if (!categoryBox) {
+    const icons = await toolbarIconButtons(page);
+    if (!icons[0]) {
+      const dump = await dumpMarketWatchText(page);
+      await screenshot(page, 'no-new-chart-icon');
+      throw new Error('Toolbar "New Chart" icon not found (needed to open the symbol-category menu). Visible text: ' + JSON.stringify(dump).slice(0, 600) + ' — see screenshot.');
+    }
+    await page.mouse.click(icons[0].x, icons[0].y);
+    openedViaNewChart = true;
+    await sleep(900);
+    await screenshot(page, 'new-chart-menu-opened');
+    categoryBox = await findCategoryBox(page);
+    if (!categoryBox) {
+      // give it one more moment — some UIs animate the menu open
+      await sleep(1000);
+      categoryBox = await findCategoryBox(page);
+    }
   }
   if (!categoryBox) {
     const dump = await dumpMarketWatchText(page);
     await screenshot(page, 'forex-category-not-found');
-    throw new Error('No Market Watch category (Forex/Metals/...) found. Visible Market Watch text: ' + JSON.stringify(dump).slice(0, 600) + ' — see screenshot.');
+    throw new Error(`No category node (Forex/Metals/...) found${openedViaNewChart ? ' even after opening the "New Chart" menu' : ''}. Visible text: ` +
+      JSON.stringify(dump).slice(0, 600) + ' — see screenshot.');
   }
   await page.mouse.click(categoryBox.x, categoryBox.y);
-  console.log(`[exness] opened Market Watch category "${categoryUsed}"`);
+  console.log(`[exness] opened symbol category "${categoryBox.name}"${openedViaNewChart ? ' (via New Chart menu)' : ''}`);
   await sleep(900);
 
   const foundText = await page.evaluate((cands) => {
@@ -869,7 +908,7 @@ async function pickSymbolFromMarketWatch(page, candidates) {
   }, candidates);
   if (!foundText) {
     await screenshot(page, 'forex-flyout-no-match');
-    throw new Error('Symbol not found in the Market Watch Forex flyout (see screenshot)');
+    throw new Error(`Symbol not found in the "${categoryBox.name}" flyout (see screenshot)`);
   }
   await sleep(400);
   const box = await page.evaluate((wanted) => {
