@@ -999,6 +999,112 @@ function terminalSymbolCandidates(pair) {
   return [...new Set(out)];
 }
 
+/**
+ * Forces MetaTrader Web to load hidden symbols into the DOM.
+ * Mimics: Right-click Market Watch -> Symbols -> Select Category -> click Show
+ */
+async function revealHiddenSymbols(page, categoryName = 'Forex') {
+  console.log(`[exness] Unhiding symbols for category: ${categoryName}...`);
+  await ensureMarketWatchVisible(page);
+  await sleep(1000);
+
+  // 1. Find ANY visible symbol in the list to right-click
+  const firstSymbol = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const rows = [...document.querySelectorAll('td, span, div, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0 && /^[A-Z]{6}$/.test((e.innerText || '').trim()));
+    
+    if (!rows.length) return null;
+    const r = rows[0].getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (!firstSymbol) {
+    console.warn('[exness] No symbols found to right-click. Market watch might be empty.');
+    return false;
+  }
+
+  // Right-click to open context menu
+  await page.mouse.click(firstSymbol.x, firstSymbol.y, { button: 'right' });
+  await sleep(1000);
+
+  // 2. Click "Symbols" in the context menu
+  const symbolsMenuOption = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const opts = [...document.querySelectorAll('td, span, div, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === 'Symbols');
+      
+    if (!opts.length) return null;
+    const r = opts[0].getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (!symbolsMenuOption) throw new Error('Context menu option "Symbols" not found.');
+  await page.mouse.click(symbolsMenuOption.x, symbolsMenuOption.y);
+  await sleep(1500); // Wait for the Symbols modal to pop up
+
+  // 3. Find and click the specified category (e.g., "Forex" or "Metals")
+  const categoryItem = await page.evaluate((cat) => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')].find(m => vis(m) && /Symbols/i.test(m.innerText));
+    if (!modal) return null;
+    
+    const items = [...modal.querySelectorAll('td, span, div, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim().toLowerCase() === cat.toLowerCase());
+      
+    if (!items.length) return null;
+    const r = items[0].getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, categoryName);
+
+  if (!categoryItem) {
+    console.warn(`[exness] Category "${categoryName}" not found in Symbols modal.`);
+  } else {
+    await page.mouse.click(categoryItem.x, categoryItem.y);
+    await sleep(1000);
+  }
+
+  // 4. Click "Show"
+  const showBtn = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')].find(m => vis(m) && /Symbols/i.test(m.innerText));
+    if (!modal) return null;
+    
+    const btn = [...modal.querySelectorAll('button')].find((b) => vis(b) && (b.innerText || '').trim() === 'Show');
+    if (!btn) return null;
+    
+    const r = btn.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (showBtn) {
+    await page.mouse.click(showBtn.x, showBtn.y);
+    console.log(`[exness] Clicked "Show" for ${categoryName}. All pairs should now be visible.`);
+    await sleep(1000);
+  }
+
+  // 5. Click "Close" to exit the modal
+  const closeBtn = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')].find(m => vis(m) && /Symbols/i.test(m.innerText));
+    if (!modal) return null;
+    
+    const btn = [...modal.querySelectorAll('button')].find((b) => vis(b) && (b.innerText || '').trim() === 'Close');
+    if (!btn) return null;
+    
+    const r = btn.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (closeBtn) {
+    await page.mouse.click(closeBtn.x, closeBtn.y);
+    await sleep(1000);
+  }
+  
+  return true;
+}
+
+
 async function placeOrder(page, sig) {
   const { action, lot, sl, tp } = sig;
   const candidates = terminalSymbolCandidates(sig.pair);
@@ -1007,22 +1113,25 @@ async function placeOrder(page, sig) {
   // 0) sanity: if the login dialog is somehow still open, stop
   if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
 
-  // 1) open the order ticket AND get the right symbol selected in it
-  await openOrderTicket(page, candidates);
-  await screenshot(page, 'order-ticket');
+  // --- NEW LOGIC: Force symbols to load BEFORE trying to trade ---
+  // Try revealing Forex first. If trading Gold, you might also want to chain this with 'Metals'.
+  try {
+      await revealHiddenSymbols(page, 'Forex');
+      
+      // Optional: If you trade Gold heavily, reveal Metals too just to be safe
+      if (pair.includes('XAU')) {
+         await revealHiddenSymbols(page, 'Metals');
+      }
+  } catch (e) {
+      console.warn('[exness] Non-fatal error while revealing symbols:', e.message);
+  }
+  // ---------------------------------------------------------------
 
-  // 2) volume / SL / TP — direct IDs first (verified), label lookup as fallback
-  const setInput = async (id, label, value) => {
-    let el = await page.$('#' + id);
-    if (!el) {
-      const handle = await fieldForLabel(page, label);
-      el = handle ? handle.asElement() : null;
-    }
-    if (!el) { console.warn(`[exness] input for "${label}" (#${id}) not found`); return false; }
-    await clearAndType(page, el, String(value));
-    console.log(`[exness] set ${label} = ${value}`);
-    return true;
-  };
+  // 1) open the order ticket AND get the right symbol selected in it
+  await openOrderTicket(page, candidates); // Now that they are unhidden, this will work!
+  await screenshot(page, 'order-ticket');
+  
+  // ... rest of your existing placeOrder function ...
   await setInput('volume', 'Volume', lot);
   if (sl != null) await setInput('sl', 'Stop Loss', sl);
   if (tp != null) await setInput('tp', 'Take Profit', tp);
