@@ -544,7 +544,7 @@ async function closeOrderTicket(page) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Robust Market Watch helpers (fixed element detection)              */
+/*  Robust Market Watch helpers (with diagnostics)                     */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -708,9 +708,30 @@ async function waitForSymbolInMarketWatch(page, symbol, timeout = 15000) {
 }
 
 /**
+ * Diagnostic: dump visible text containing any of the given keywords.
+ * Returns array of unique trimmed strings, limited to 50.
+ */
+async function dumpVisibleTextContaining(page, keywords) {
+  return page.evaluate((keywords) => {
+    const vis = (el) => el.offsetParent !== null;
+    const all = [...document.querySelectorAll('*')].filter(vis);
+    const texts = new Set();
+    for (const el of all) {
+      const t = (el.innerText || '').trim();
+      if (!t) continue;
+      const lower = t.toLowerCase();
+      if (keywords.some(kw => lower.includes(kw))) {
+        texts.add(t.slice(0, 200));
+      }
+    }
+    return Array.from(texts).slice(0, 50);
+  }, keywords);
+}
+
+/**
  * Unhide all symbols from a category (e.g. "Forex").
  * Workflow: right‑click Market Watch pair → Symbols → click category → click Show → Close.
- * Now avoids strict modal detection and proceeds directly with text clicks.
+ * Includes diagnostic logging to identify exact category names.
  */
 async function revealHiddenSymbols(page, categories = ['Forex']) {
   for (const category of categories) {
@@ -737,16 +758,40 @@ async function revealHiddenSymbols(page, categories = ['Forex']) {
     }
     await page.mouse.click(symbolsMenu.x, symbolsMenu.y);
     console.log('[exness] Clicked "Symbols". Waiting for dialog...');
-    await sleep(2000); // give modal time to render
+    await sleep(3000); // wait longer for modal to render
 
-    // 3. Directly attempt to click the category (e.g., "Forex")
-    const catBox = await findElementByText(page, category, 5000);
+    // === DIAGNOSTIC: dump visible text containing likely category names ===
+    const diagKeywords = ['forex', 'metal', 'show', 'close', 'symbol'];
+    const diagTexts = await dumpVisibleTextContaining(page, diagKeywords);
+    console.log('[exness] DIAG after Symbols click (visible texts containing keywords):');
+    diagTexts.forEach((t, i) => console.log(`  [${i}] ${t}`));
+    await screenshot(page, 'after-symbols-click');
+
+    // 3. Try to click the category (with multiple possible variations)
+    const categoryVariants = [
+      category,
+      category + ' Majors',
+      category + ' Crosses',
+      category + ' Exotics',
+      category + ' Minor',
+      category + ' Major',
+      category === 'Forex' ? 'Forex Majors' : 'Precious Metals',
+      category === 'Forex' ? 'Forex Crosses' : 'Metals',
+    ];
+    let catBox = null;
+    for (const variant of categoryVariants) {
+      catBox = await findElementByText(page, variant, 3000);
+      if (catBox) {
+        console.log(`[exness] Found category element: "${variant}"`);
+        break;
+      }
+    }
     if (catBox) {
       await page.mouse.click(catBox.x, catBox.y);
       console.log(`[exness] Clicked category "${category}".`);
       await sleep(800);
     } else {
-      console.warn(`[exness] Category "${category}" not found. Pressing Escape.`);
+      console.warn(`[exness] Category "${category}" not found after diagnostic. Pressing Escape.`);
       await page.keyboard.press('Escape').catch(() => {});
       continue;
     }
@@ -1110,5 +1155,5 @@ module.exports = {
   isOrderTicketOpen, focusTerminal, revealHiddenSymbols,
   // Export new helpers for debugging if needed
   findElementByText, findMarketWatchSymbolAnchor, ensureMarketWatchVisible,
-  waitForSymbolInMarketWatch
+  waitForSymbolInMarketWatch, dumpVisibleTextContaining
 };
