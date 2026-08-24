@@ -544,24 +544,20 @@ async function closeOrderTicket(page) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  NEW: Robust Market Watch helpers (fixed element detection)         */
+/*  Robust Market Watch helpers (fixed element detection)              */
 /* ------------------------------------------------------------------ */
 
 /**
- * Generic helper: find a visible element by exact text, scoped to a container (optional).
+ * Generic helper: find a visible element by exact text.
  * Does NOT require leaf nodes. Picks the innermost (smallest area) match.
  */
-async function findElementByText(page, text, scopeSelector = null, timeout = 5000) {
+async function findElementByText(page, text, timeout = 5000) {
   const needle = String(text).toLowerCase();
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const result = await page.evaluate((needle, scopeSelector) => {
+    const result = await page.evaluate((needle) => {
       const vis = (el) => el.offsetParent !== null;
-      let scope = document;
-      if (scopeSelector) {
-        scope = document.querySelector(scopeSelector) || document;
-      }
-      const all = [...scope.querySelectorAll('*')].filter(vis);
+      const all = [...document.querySelectorAll('*')].filter(vis);
       const matches = all.filter(e => (e.innerText || '').trim().toLowerCase() === needle);
       if (!matches.length) return null;
       
@@ -575,7 +571,7 @@ async function findElementByText(page, text, scopeSelector = null, timeout = 500
       const r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) return null;
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    }, needle, scopeSelector);
+    }, needle);
     
     if (result) return result;
     await sleep(500);
@@ -626,7 +622,7 @@ async function findMarketWatchSymbolAnchor(page) {
   
   // Fallback: try right‑clicking on the "Market Watch" header or panel title
   console.log('[exness] No symbol anchor found, trying Market Watch header...');
-  const header = await findElementByText(page, 'Market Watch', null, 3000);
+  const header = await findElementByText(page, 'Market Watch', 3000);
   if (header) {
     console.log('[exness] Found "Market Watch" header for right‑click.');
     return header;
@@ -686,67 +682,6 @@ async function ensureMarketWatchVisible(page) {
 }
 
 /**
- * Wait for the Symbols dialog to appear (after right‑click → Symbols).
- */
-async function waitForSymbolsModal(page, timeout = 10000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const open = await page.evaluate(() => {
-      const vis = (el) => el.offsetParent !== null;
-      const containers = [...document.querySelectorAll('div, section, [class*="modal" i], [class*="dialog" i]')]
-        .filter(vis);
-      return containers.some(c => {
-        const t = c.innerText || '';
-        return /Symbols/i.test(t) && /Show/i.test(t) && /Close/i.test(t);
-      });
-    });
-    if (open) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-/**
- * Click a text inside the Symbols modal.
- */
-async function clickInsideSymbolsModalByText(page, text) {
-  const needle = String(text).toLowerCase();
-  const box = await page.evaluate((needle) => {
-    const vis = (el) => el.offsetParent !== null;
-
-    // Locate the Symbols modal
-    let modal = null;
-    const containers = [...document.querySelectorAll('div, section, [class*="modal" i], [class*="dialog" i]')]
-      .filter(vis);
-    modal = containers.find(c => {
-      const t = c.innerText || '';
-      return /Symbols/i.test(t) && /Show/i.test(t) && /Close/i.test(t);
-    }) || document;
-
-    const els = [...modal.querySelectorAll('*')].filter(vis);
-    const matches = els.filter(e => (e.innerText || '').trim().toLowerCase() === needle);
-    if (!matches.length) return null;
-
-    // Choose the innermost (smallest area)
-    const el = matches.reduce((best, curr) => {
-      const r1 = best.getBoundingClientRect();
-      const r2 = curr.getBoundingClientRect();
-      return (r1.width * r1.height) <= (r2.width * r2.height) ? best : curr;
-    });
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) return null;
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  }, needle);
-
-  if (box) {
-    await page.mouse.click(box.x, box.y);
-    await sleep(800);
-    return true;
-  }
-  return false;
-}
-
-/**
  * Wait for a specific symbol to appear in Market Watch.
  */
 async function waitForSymbolInMarketWatch(page, symbol, timeout = 15000) {
@@ -774,6 +709,8 @@ async function waitForSymbolInMarketWatch(page, symbol, timeout = 15000) {
 
 /**
  * Unhide all symbols from a category (e.g. "Forex").
+ * Workflow: right‑click Market Watch pair → Symbols → click category → click Show → Close.
+ * Now avoids strict modal detection and proceeds directly with text clicks.
  */
 async function revealHiddenSymbols(page, categories = ['Forex']) {
   for (const category of categories) {
@@ -792,41 +729,48 @@ async function revealHiddenSymbols(page, categories = ['Forex']) {
     await sleep(1200);
 
     // 2. Click "Symbols" in context menu
-    const symbolsMenu = await findElementByText(page, 'Symbols', null, 5000);
+    const symbolsMenu = await findElementByText(page, 'Symbols', 5000);
     if (!symbolsMenu) {
       console.warn('[exness] Context menu "Symbols" not found. Pressing Escape.');
       await page.keyboard.press('Escape').catch(() => {});
       continue;
     }
     await page.mouse.click(symbolsMenu.x, symbolsMenu.y);
-    const modalOpened = await waitForSymbolsModal(page, 10000);
-    if (!modalOpened) {
-      console.warn('[exness] Symbols modal did not open.');
-      await screenshot(page, 'symbols-modal-not-open');
-      continue;
-    }
+    console.log('[exness] Clicked "Symbols". Waiting for dialog...');
+    await sleep(2000); // give modal time to render
 
-    // 3. Click category
-    const catClicked = await clickInsideSymbolsModalByText(page, category);
-    if (!catClicked) {
-      console.warn(`[exness] Category "${category}" not found in Symbols modal.`);
-      await clickInsideSymbolsModalByText(page, 'Close');
+    // 3. Directly attempt to click the category (e.g., "Forex")
+    const catBox = await findElementByText(page, category, 5000);
+    if (catBox) {
+      await page.mouse.click(catBox.x, catBox.y);
+      console.log(`[exness] Clicked category "${category}".`);
+      await sleep(800);
+    } else {
+      console.warn(`[exness] Category "${category}" not found. Pressing Escape.`);
+      await page.keyboard.press('Escape').catch(() => {});
       continue;
     }
-    await sleep(800);
 
     // 4. Click "Show"
-    const showClicked = await clickInsideSymbolsModalByText(page, 'Show');
-    if (showClicked) {
+    const showBox = await findElementByText(page, 'Show', 5000);
+    if (showBox) {
+      await page.mouse.click(showBox.x, showBox.y);
       console.log(`[exness] Clicked "Show" for ${category}.`);
+      await sleep(1000);
     } else {
-      console.warn('[exness] "Show" button not found in Symbols modal.');
+      console.warn('[exness] "Show" button not found.');
     }
-    await sleep(1000);
 
     // 5. Click "Close"
-    await clickInsideSymbolsModalByText(page, 'Close');
-    await sleep(1500);
+    const closeBox = await findElementByText(page, 'Close', 5000);
+    if (closeBox) {
+      await page.mouse.click(closeBox.x, closeBox.y);
+      console.log('[exness] Clicked "Close".');
+      await sleep(1500);
+    } else {
+      console.warn('[exness] "Close" button not found. Pressing Escape.');
+      await page.keyboard.press('Escape').catch(() => {});
+    }
   }
   console.log('[exness] Symbol reveal routine finished.');
 }
@@ -1165,6 +1109,6 @@ module.exports = {
   terminalSymbolCandidates, openOrderTicket, closeOrderTicket, toolbarIconButtons,
   isOrderTicketOpen, focusTerminal, revealHiddenSymbols,
   // Export new helpers for debugging if needed
-  findElementByText, findMarketWatchSymbolAnchor, ensureMarketWatchVisible, waitForSymbolsModal,
-  clickInsideSymbolsModalByText, waitForSymbolInMarketWatch
+  findElementByText, findMarketWatchSymbolAnchor, ensureMarketWatchVisible,
+  waitForSymbolInMarketWatch
 };
