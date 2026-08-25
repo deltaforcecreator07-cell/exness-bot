@@ -114,7 +114,7 @@ async function clickVisibleText(page, wanted, timeout = 8000) {
       const els = [...document.querySelectorAll('*')]
         .filter((e) => e.offsetParent !== null && list.some((w) => (e.innerText || '').trim().toLowerCase() === w.toLowerCase()));
       if (!els.length) return null;
-      const el = els[els.length - 1]; // innermost node
+      const el = els[els.length - 1];
       const r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) return null;
       return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
@@ -164,7 +164,7 @@ function cleanupScreenshots(keep = 12) {
 }
 
 async function launchBrowser() {
-  const puppeteer = require('puppeteer'); // lazy require
+  const puppeteer = require('puppeteer');
   const args = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -237,7 +237,7 @@ async function switchToMT5(page) {
     await waitAfterSwitch(page);
     return;
   }
-  
+
   const opened = await page.evaluate(() => {
     const el = [...document.querySelectorAll('*')]
       .filter(e => e.offsetParent !== null)
@@ -245,7 +245,7 @@ async function switchToMT5(page) {
     if (el) { el.click(); return true; }
     return false;
   });
-  
+
   if (opened) {
     console.log('[exness] found switch trigger, clicked it');
     await sleep(1500);
@@ -388,7 +388,7 @@ async function loginFlow(page) {
       console.log('[exness] MT5 switch requested after OK — refreshing into MT5 mode...');
       try { await waitAfterSwitch(page, 60000); } catch (e) { console.warn('[exness] wait after switch:', e.message); }
       await sleep(2000);
-      continue; 
+      continue;
     }
 
     const diagSnapshots = [];
@@ -503,7 +503,7 @@ async function toolbarIconButtons(page) {
       .map((el) => ({ r: el.getBoundingClientRect() }))
       .filter(({ r }) => r.width >= 12 && r.width <= 44 && r.height >= 12 && r.height <= 44 && r.top < 140 && r.left < 400)
       .sort((a, b) => a.r.left - b.r.left);
-      
+
     const out = [];
     for (const o of all) {
       const x = o.r.left + o.r.width / 2, y = o.r.top + o.r.height / 2;
@@ -543,323 +543,29 @@ async function closeOrderTicket(page) {
   return !stillOpen;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Robust Market Watch helpers (with diagnostics)                     */
-/* ------------------------------------------------------------------ */
-
-/**
- * Generic helper: find a visible element by exact text.
- * Does NOT require leaf nodes. Picks the innermost (smallest area) match.
- */
-async function findElementByText(page, text, timeout = 5000) {
-  const needle = String(text).toLowerCase();
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const result = await page.evaluate((needle) => {
-      const vis = (el) => el.offsetParent !== null;
-      const all = [...document.querySelectorAll('*')].filter(vis);
-      const matches = all.filter(e => (e.innerText || '').trim().toLowerCase() === needle);
-      if (!matches.length) return null;
-      
-      // Choose the element with the smallest bounding box (innermost)
-      const el = matches.reduce((best, curr) => {
-        const r1 = best.getBoundingClientRect();
-        const r2 = curr.getBoundingClientRect();
-        return (r1.width * r1.height) <= (r2.width * r2.height) ? best : curr;
-      });
-      
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return null;
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    }, needle);
-    
-    if (result) return result;
-    await sleep(500);
-  }
-  return null;
-}
-
-/**
- * Find a clickable anchor in Market Watch by looking for any symbol‑like text.
- * Returns coordinates for right‑click.
- */
-async function findMarketWatchSymbolAnchor(page) {
-  const anchor = await page.evaluate(() => {
+async function ensureMarketWatchVisible(page) {
+  const hasRows = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    const all = [...document.querySelectorAll('*')].filter(vis);
-    
-    // Look for elements whose text matches a 6-letter uppercase symbol (e.g., EURUSD)
-    const symbolPattern = /^[A-Z]{6}$/;
-    const symbolEls = all.filter(e => {
-      const txt = (e.innerText || '').trim();
-      return symbolPattern.test(txt);
-    });
-    
-    if (symbolEls.length === 0) return null;
-    
-    // Prefer elements located on the left side of the screen (Market Watch panel)
-    const leftEls = symbolEls.filter(e => {
-      const r = e.getBoundingClientRect();
-      return r.left < 700 && r.top > 80 && r.width > 0 && r.height > 0;
-    });
-    
-    const candidates = leftEls.length ? leftEls : symbolEls;
-    // Choose the one with smallest area (likely the innermost text node)
-    const best = candidates.reduce((best, curr) => {
-      const r1 = best.getBoundingClientRect();
-      const r2 = curr.getBoundingClientRect();
-      return (r1.width * r1.height) <= (r2.width * r2.height) ? best : curr;
-    });
-    
-    const r = best.getBoundingClientRect();
+    return [...document.querySelectorAll('div, span, td, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .some((e) => /^[A-Z]{6}$/.test((e.innerText || '').trim()));
+  });
+  if (hasRows) return true;
+  const tabBox = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('div, span, td, li, button')]
+      .filter(vis)
+      .find((e) => (e.innerText || '').trim() === 'Symbols');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
   });
-  
-  if (anchor) {
-    console.log('[exness] Found Market Watch symbol anchor at', anchor);
-    return anchor;
-  }
-  
-  // Fallback: try right‑clicking on the "Market Watch" header or panel title
-  console.log('[exness] No symbol anchor found, trying Market Watch header...');
-  const header = await findElementByText(page, 'Market Watch', 3000);
-  if (header) {
-    console.log('[exness] Found "Market Watch" header for right‑click.');
-    return header;
-  }
-  
-  return null;
-}
-
-/**
- * Ensure Market Watch panel is visible. Tries clicking tab or Ctrl+M.
- */
-async function ensureMarketWatchVisible(page) {
-  // Check if any symbol is already visible (flexible pattern)
-  const hasSymbols = await page.evaluate(() => {
-    const vis = (el) => el.offsetParent !== null;
-    const all = [...document.querySelectorAll('*')].filter(vis);
-    const symbolPattern = /^[A-Z]{6}$/;
-    return all.some(e => symbolPattern.test((e.innerText || '').trim()));
-  });
-  if (hasSymbols) {
-    console.log('[exness] Market Watch appears visible (symbol found).');
+  if (tabBox) {
+    await page.mouse.click(tabBox.x, tabBox.y);
+    await sleep(600);
     return true;
   }
-  
-  // Try clicking "Market Watch" tab/button
-  const tab = await page.evaluate(() => {
-    const vis = (el) => el.offsetParent !== null;
-    const candidates = [...document.querySelectorAll('button, [role="button"], div, span, a, td')]
-      .filter(vis)
-      .filter(e => /Market Watch/i.test((e.title || e.innerText || '').trim()));
-    if (!candidates.length) return null;
-    const r = candidates[0].getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-  });
-  if (tab) {
-    console.log('[exness] Clicking Market Watch tab...');
-    await page.mouse.click(tab.x, tab.y);
-    await sleep(2000);
-  } else {
-    console.log('[exness] Trying Ctrl+M to open Market Watch...');
-    await page.keyboard.down('Control');
-    await page.keyboard.press('KeyM');
-    await page.keyboard.up('Control');
-    await sleep(2000);
-  }
-  
-  // Re‑check
-  const hasAfter = await page.evaluate(() => {
-    const vis = (el) => el.offsetParent !== null;
-    const all = [...document.querySelectorAll('*')].filter(vis);
-    const symbolPattern = /^[A-Z]{6}$/;
-    return all.some(e => symbolPattern.test((e.innerText || '').trim()));
-  });
-  if (hasAfter) console.log('[exness] Market Watch is now visible.');
-  else console.warn('[exness] Market Watch still not visible after attempts.');
-  return hasAfter;
-}
-
-/**
- * Wait for a specific symbol to appear in Market Watch.
- */
-async function waitForSymbolInMarketWatch(page, symbol, timeout = 15000) {
-  const sym = String(symbol).toUpperCase();
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const box = await page.evaluate((sym) => {
-      const vis = (el) => el.offsetParent !== null;
-      const all = [...document.querySelectorAll('*')].filter(vis);
-      const matches = all.filter(e => (e.innerText || '').trim().toUpperCase() === sym);
-      if (!matches.length) return null;
-      const el = matches.reduce((best, curr) => {
-        const r1 = best.getBoundingClientRect();
-        const r2 = curr.getBoundingClientRect();
-        return (r1.width * r1.height) <= (r2.width * r2.height) ? best : curr;
-      });
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    }, sym);
-    if (box) return box;
-    await sleep(1000);
-  }
-  return null;
-}
-
-/**
- * Diagnostic: dump visible text containing any of the given keywords.
- * Returns array of unique trimmed strings, limited to 50.
- */
-async function dumpVisibleTextContaining(page, keywords) {
-  return page.evaluate((keywords) => {
-    const vis = (el) => el.offsetParent !== null;
-    const all = [...document.querySelectorAll('*')].filter(vis);
-    const texts = new Set();
-    for (const el of all) {
-      const t = (el.innerText || '').trim();
-      if (!t) continue;
-      const lower = t.toLowerCase();
-      if (keywords.some(kw => lower.includes(kw))) {
-        texts.add(t.slice(0, 200));
-      }
-    }
-    return Array.from(texts).slice(0, 50);
-  }, keywords);
-}
-
-/**
- * Unhide all symbols from a category (e.g. "Forex").
- * Workflow: right‑click Market Watch pair → Symbols → click category → click Show → Close.
- * Includes diagnostic logging to identify exact category names.
- */
-async function revealHiddenSymbols(page, categories = ['Forex']) {
-  for (const category of categories) {
-    console.log(`[exness] Unhiding symbols for category: ${category}...`);
-    await ensureMarketWatchVisible(page);
-    await sleep(1000);
-
-    // 1. Right‑click a Market Watch symbol or header
-    const anchor = await findMarketWatchSymbolAnchor(page);
-    if (!anchor) {
-      console.warn('[exness] Could not find any Market Watch symbol or header to right‑click.');
-      await screenshot(page, 'no-anchor-for-rightclick');
-      continue;
-    }
-    await page.mouse.click(anchor.x, anchor.y, { button: 'right' });
-    await sleep(1200);
-
-    // 2. Click "Symbols" in context menu
-    const symbolsMenu = await findElementByText(page, 'Symbols', 5000);
-    if (!symbolsMenu) {
-      console.warn('[exness] Context menu "Symbols" not found. Pressing Escape.');
-      await page.keyboard.press('Escape').catch(() => {});
-      continue;
-    }
-    await page.mouse.click(symbolsMenu.x, symbolsMenu.y);
-    console.log('[exness] Clicked "Symbols". Waiting for dialog...');
-    await sleep(3000); // wait longer for modal to render
-
-    // === DIAGNOSTIC: dump visible text containing likely category names ===
-    const diagKeywords = ['forex', 'metal', 'show', 'close', 'symbol'];
-    const diagTexts = await dumpVisibleTextContaining(page, diagKeywords);
-    console.log('[exness] DIAG after Symbols click (visible texts containing keywords):');
-    diagTexts.forEach((t, i) => console.log(`  [${i}] ${t}`));
-    await screenshot(page, 'after-symbols-click');
-
-    // 3. Try to click the category (with multiple possible variations)
-    const categoryVariants = [
-      category,
-      category + ' Majors',
-      category + ' Crosses',
-      category + ' Exotics',
-      category + ' Minor',
-      category + ' Major',
-      category === 'Forex' ? 'Forex Majors' : 'Precious Metals',
-      category === 'Forex' ? 'Forex Crosses' : 'Metals',
-    ];
-    let catBox = null;
-    for (const variant of categoryVariants) {
-      catBox = await findElementByText(page, variant, 3000);
-      if (catBox) {
-        console.log(`[exness] Found category element: "${variant}"`);
-        break;
-      }
-    }
-    if (catBox) {
-      await page.mouse.click(catBox.x, catBox.y);
-      console.log(`[exness] Clicked category "${category}".`);
-      await sleep(800);
-    } else {
-      console.warn(`[exness] Category "${category}" not found after diagnostic. Pressing Escape.`);
-      await page.keyboard.press('Escape').catch(() => {});
-      continue;
-    }
-
-    // 4. Click "Show"
-    const showBox = await findElementByText(page, 'Show', 5000);
-    if (showBox) {
-      await page.mouse.click(showBox.x, showBox.y);
-      console.log(`[exness] Clicked "Show" for ${category}.`);
-      await sleep(1000);
-    } else {
-      console.warn('[exness] "Show" button not found.');
-    }
-
-    // 5. Click "Close"
-    const closeBox = await findElementByText(page, 'Close', 5000);
-    if (closeBox) {
-      await page.mouse.click(closeBox.x, closeBox.y);
-      console.log('[exness] Clicked "Close".');
-      await sleep(1500);
-    } else {
-      console.warn('[exness] "Close" button not found. Pressing Escape.');
-      await page.keyboard.press('Escape').catch(() => {});
-    }
-  }
-  console.log('[exness] Symbol reveal routine finished.');
-}
-
-/**
- * Open order ticket for a symbol by double‑clicking it in Market Watch.
- */
-async function openOrderTicket(page, candidates) {
-  console.log('[exness] Searching for symbol directly in the Market Watch panel...');
-  await ensureMarketWatchVisible(page);
-  await sleep(1000);
-
-  for (const cand of candidates) {
-    const found = await waitForSymbolInMarketWatch(page, cand, 5000);
-    if (!found) continue;
-
-    console.log(`[exness] Found symbol "${cand}" in Market Watch.`);
-    const box = await page.evaluate((sym) => {
-      const vis = (el) => el.offsetParent !== null;
-      const all = [...document.querySelectorAll('*')].filter(vis);
-      const matches = all.filter(e => (e.innerText || '').trim().toUpperCase() === sym.toUpperCase());
-      if (!matches.length) return null;
-      const el = matches.reduce((best, curr) => {
-        const r1 = best.getBoundingClientRect();
-        const r2 = curr.getBoundingClientRect();
-        return (r1.width * r1.height) <= (r2.width * r2.height) ? best : curr;
-      });
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
-      const r = el.getBoundingClientRect();
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-    }, cand);
-
-    if (box) {
-      await page.mouse.click(box.x, box.y, { clickCount: 2, delay: 100 });
-      await sleep(2500);
-      if (await isOrderTicketOpen(page)) {
-        console.log('[exness] Order ticket successfully opened and pre‑filled via Market Watch double‑click.');
-        return;
-      }
-    }
-  }
-
-  await screenshot(page, 'symbol-not-in-market-watch');
-  throw new Error(`Symbol not found in Market Watch list. Candidates tried: ${candidates.join(', ')}. See screenshot.`);
+  return false;
 }
 
 function symbolAliases() {
@@ -882,29 +588,242 @@ function terminalSymbolCandidates(pair) {
   return [...new Set(out)];
 }
 
+/**
+ * Quick check: is any of the candidate symbols already visible as a plain
+ * row in Market Watch? VERIFIED (2026-08-21 recording): once a category has
+ * been "Shown" via the Symbols dialog, it stays shown across sessions (tied
+ * to the trading account, not the browser) — the very first frame of that
+ * recording already had XAUUSD sitting in Market Watch from an earlier run.
+ * So on every trade after the first ever reveal, this lets us skip the
+ * entire right-click -> Symbols -> Forex -> Show -> Close dance (~6-8s and
+ * several fragile clicks) and go straight to double-clicking the row.
+ */
+async function symbolAlreadyInMarketWatch(page, candidates) {
+  return page.evaluate((cands) => {
+    const vis = (el) => el.offsetParent !== null;
+    const upCands = cands.map((c) => String(c).toUpperCase());
+    return [...document.querySelectorAll('div, span, td, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .some((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
+  }, candidates);
+}
+
+/**
+ * Forces MetaTrader Web to load hidden symbols into the DOM.
+ * Mimics: Right-click Market Watch -> Symbols... -> select category -> Show -> Close
+ * VERIFIED end-to-end from a screen recording (2026-08-21): the context menu
+ * item is literally "Symbols..." WITH the trailing ellipsis — an earlier
+ * version of this function matched the exact text "Symbols" and therefore
+ * never actually found/clicked it, so nothing after that step ever ran.
+ * The category tree in this account is: Forex, Crypto, CryptoCross,
+ * Energies, Indices, Stocks, Idx_Enlarge, Forex_Indicator — there is no
+ * separate "Metals" category; Gold lives inside "Forex".
+ */
+async function revealHiddenSymbols(page, categoryName = 'Forex') {
+  console.log(`[exness] Unhiding symbols for category: ${categoryName}...`);
+  await ensureMarketWatchVisible(page);
+  await sleep(1000);
+
+  const clickPos = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
+
+    const targets = allEls.filter(e => /^(EURUSD|USDJPY|GBPUSD|USDCHF|USDCAD|AUDUSD)[a-z0-9]*$/i.test((e.innerText || '').trim()));
+    if (targets.length) {
+        const target = targets[targets.length - 1];
+        const r = target.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }
+
+    const headers = allEls.filter(e => (e.innerText || '').trim() === 'Symbol');
+    if (headers.length) {
+        const header = headers[headers.length - 1];
+        const r = header.getBoundingClientRect();
+        return { x: r.x + 10, y: r.y + 35 };
+    }
+
+    return null;
+  });
+
+  if (!clickPos) {
+    console.warn('[exness] Could not find a reliable Market Watch element to right-click.');
+    return false;
+  }
+
+  await page.mouse.click(clickPos.x, clickPos.y, { button: 'right' });
+  await sleep(1200);
+
+  const symbolsMenuOption = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
+
+    // VERIFIED: the real menu text is "Symbols..." (with ellipsis) — strip
+    // trailing dots before comparing so this matches regardless of exactly
+    // how many the skin renders, instead of requiring an exact 'Symbols'.
+    const norm = (s) => (s || '').trim().replace(/\.+$/, '');
+    const opts = allEls.filter((e) => e.childElementCount === 0 && norm(e.innerText) === 'Symbols');
+    if (!opts.length) return null;
+
+    const opt = opts[opts.length - 1];
+    const r = opt.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (!symbolsMenuOption) {
+      console.warn('[exness] Context menu option "Symbols..." not found. The right click might have missed.');
+      await page.keyboard.press('Escape');
+      return false;
+  }
+
+  await page.mouse.click(symbolsMenuOption.x, symbolsMenuOption.y);
+  await sleep(1500);
+
+  const clickedCat = await page.evaluate((cat) => {
+    const vis = (el) => el.offsetParent !== null;
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
+    const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
+    if (!symbolsModal) return false;
+
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const items = allEls.filter((e) => (e.innerText || '').trim().toLowerCase() === cat.toLowerCase());
+
+    if (!items.length) return false;
+    const item = items[items.length - 1];
+    const r = item.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, categoryName);
+
+  if (clickedCat) {
+    await page.mouse.click(clickedCat.x, clickedCat.y);
+    await sleep(1000);
+  } else {
+    console.warn(`[exness] Category "${categoryName}" not found in Symbols modal.`);
+  }
+
+  const showBtn = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
+    const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
+    if (!symbolsModal) return null;
+
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const buttons = allEls.filter((b) => (b.innerText || '').trim() === 'Show');
+    if (!buttons.length) return null;
+
+    const btn = buttons[buttons.length - 1];
+    const r = btn.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (showBtn) {
+    await page.mouse.click(showBtn.x, showBtn.y);
+    console.log(`[exness] Clicked "Show" for ${categoryName}.`);
+    await sleep(1000);
+  }
+
+  const closeBtn = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modals = [...document.querySelectorAll('.page-window.modal')].filter(vis);
+    const symbolsModal = modals.find(m => /Symbols/i.test(m.innerText));
+    if (!symbolsModal) return null;
+
+    const allEls = [...symbolsModal.querySelectorAll('*')].filter(vis);
+    const buttons = allEls.filter((b) => (b.innerText || '').trim() === 'Close');
+    if (!buttons.length) return null;
+
+    const btn = buttons[buttons.length - 1];
+    const r = btn.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+
+  if (closeBtn) {
+    await page.mouse.click(closeBtn.x, closeBtn.y);
+    await sleep(1000);
+  }
+
+  return true;
+}
+
+/**
+ * Open the order ticket for a symbol.
+ * Bypasses the toolbar and dropdowns entirely.
+ * Searches the main Market Watch list, scrolls to the symbol, and double-clicks it.
+ */
+async function openOrderTicket(page, candidates) {
+  console.log('[exness] Searching for symbol directly in the Market Watch panel...');
+  await ensureMarketWatchVisible(page);
+  await sleep(1000);
+
+  const foundBox = await page.evaluate((cands) => {
+    const vis = (el) => el.offsetParent !== null;
+    const allEls = [...document.querySelectorAll('*')].filter(vis);
+    const upCands = cands.map((c) => String(c).toUpperCase());
+
+    let matches = allEls.filter((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
+    if (!matches.length) {
+        matches = allEls.filter((e) => upCands.some((c) => (e.innerText || '').trim().toUpperCase().startsWith(c + ',')));
+    }
+
+    if (!matches.length) return null;
+
+    const row = matches[matches.length - 1];
+    row.scrollIntoView({ block: 'center', behavior: 'instant' });
+
+    const r = row.getBoundingClientRect();
+    return {
+      text: (row.innerText || '').trim(),
+      x: r.x + r.width / 2,
+      y: r.y + r.height / 2
+    };
+  }, candidates);
+
+  if (!foundBox) {
+    await screenshot(page, 'symbol-not-in-market-watch');
+    throw new Error(`Symbol not found in Market Watch list. Candidates tried: ${candidates.join(', ')}. See screenshot.`);
+  }
+
+  console.log(`[exness] Found symbol "${foundBox.text}" in Market Watch. Double-clicking to open ticket...`);
+
+  await page.mouse.click(foundBox.x, foundBox.y, { clickCount: 2, delay: 100 });
+  await sleep(2500);
+
+  if (!(await isOrderTicketOpen(page))) {
+     await screenshot(page, 'ticket-failed-to-open');
+     throw new Error('Order ticket did not open after double-clicking the symbol in Market Watch.');
+  }
+
+  console.log('[exness] Order ticket successfully opened and pre-filled via Market Watch double-click.');
+}
+
 async function placeOrder(page, sig) {
   const { action, lot, sl, tp } = sig;
   const candidates = terminalSymbolCandidates(sig.pair);
-  const pair = candidates[0]; 
+  const pair = candidates[0];
 
   if (await isLoginDialogOpen(page)) throw new Error('login dialog still open — could not reach the terminal');
 
-  // --- Unhide symbols from Forex (gold usually appears after this) ---
-  await revealHiddenSymbols(page, ['Forex']);
-
-  // Optional fallback: if gold not found, try Metals (can be removed if not wanted)
-  if (pair.includes('XAU') || pair.includes('GOLD')) {
-    const found = await waitForSymbolInMarketWatch(page, 'XAUUSD', 8000);
-    if (!found) {
-      console.warn('[exness] XAUUSD not found after Forex reveal; trying Metals fallback.');
-      await revealHiddenSymbols(page, ['Metals']);
+  // Fast path: symbol visibility is remembered per trading account (not per
+  // browser session) — once Gold has been "Shown" once, it stays in Market
+  // Watch on every future login. Only run the right-click -> Symbols... ->
+  // Forex -> Show -> Close dance when the symbol genuinely isn't there yet.
+  await ensureMarketWatchVisible(page);
+  const alreadyVisible = await symbolAlreadyInMarketWatch(page, candidates);
+  if (alreadyVisible) {
+    console.log('[exness] symbol already visible in Market Watch — skipping the reveal step');
+  } else {
+    try {
+      await revealHiddenSymbols(page, 'Forex');
+      if (!(await symbolAlreadyInMarketWatch(page, candidates)) && (pair.includes('XAU') || pair.includes('GOLD'))) {
+        await revealHiddenSymbols(page, 'Metals'); // no-op on accounts without this category, kept for safety
+      }
+    } catch (e) {
+      console.warn('[exness] Non-fatal error while revealing symbols:', e.message);
     }
   }
 
-  // --- Open the order ticket by double clicking the unhidden symbol ---
   await openOrderTicket(page, candidates);
   await screenshot(page, 'order-ticket');
-  
+
   const setInput = async (id, label, value) => {
     let el = await page.$('#' + id);
     if (!el) {
@@ -950,7 +869,7 @@ async function placeOrder(page, sig) {
       symbolInput: sel ? (sel.options[sel.selectedIndex] ? (sel.options[sel.selectedIndex].text || sel.value) : sel.value) : null,
     };
   }, action);
-  
+
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
   if (!ticketOk.ok || !ticketOk.modalFound || ticketOk.volume !== String(lot)) {
     console.warn(`[exness] ticket not ready: btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume="${ticketOk.volume}" (want "${lot}") sl="${ticketOk.sl}" tp="${ticketOk.tp}" symbol="${ticketOk.symbolInput}"`);
@@ -976,21 +895,21 @@ async function placeOrder(page, sig) {
       const r = btn.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + r.height / 2, title: (other.querySelector('.h')?.innerText || '').trim().slice(0, 40) };
     });
-    
+
     if (confirmBox) {
       console.log('[exness] confirm dialog found, clicking OK:', confirmBox.title);
       await page.mouse.click(confirmBox.x, confirmBox.y);
       await sleep(1500);
       continue;
     }
-    
+
     const ticketStillOpen = await page.evaluate(() => {
       const vis = (el) => el.offsetParent !== null;
       const m = [...document.querySelectorAll('.page-window.modal')]
         .find(x => !/hidden/.test(x.className || '') && x.querySelector('input#volume'));
       return !!m;
     });
-    
+
     if (!ticketStillOpen) {
       const st = await page.evaluate((sym) => {
         const t = document.body ? document.body.innerText : '';
@@ -1018,7 +937,7 @@ async function placeOrder(page, sig) {
     if (i < 0) return '(no journal found)';
     return txt.slice(i, i + 600).replace(/\n+/g, ' | ');
   });
-  
+
   console.log('[exness] JOURNAL AFTER ORDER:', journalAfter);
   console.log(`[exness] order result: confirmed=${confirmed} evidence=${evidence}`);
 
@@ -1067,7 +986,7 @@ async function verifyPositionsLive() {
       }
       return [...new Set(out)].slice(0, 12);
     });
-    
+
     if (!positions.length) {
       const journal = await page.evaluate(() => {
         const txt = document.body ? document.body.innerText : '';
@@ -1152,8 +1071,5 @@ module.exports = {
   isLoginDialogOpen, isTerminalVisible, waitForLoginDialog, clickSwitchModalIfVisible,
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
   terminalSymbolCandidates, openOrderTicket, closeOrderTicket, toolbarIconButtons,
-  isOrderTicketOpen, focusTerminal, revealHiddenSymbols,
-  // Export new helpers for debugging if needed
-  findElementByText, findMarketWatchSymbolAnchor, ensureMarketWatchVisible,
-  waitForSymbolInMarketWatch, dumpVisibleTextContaining
+  isOrderTicketOpen, focusTerminal, revealHiddenSymbols, symbolAlreadyInMarketWatch,
 };
