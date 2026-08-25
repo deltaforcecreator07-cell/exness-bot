@@ -75,35 +75,40 @@ async function isTerminalVisible(page) {
   });
 }
 
-async function clickTicketButton(page, action) {
-  const label = action === 'BUY' ? 'buy' : 'sell';
+async function clickTicketButton(page, action, candidateLabels = null) {
+  const labels = candidateLabels && candidateLabels.length
+    ? candidateLabels.map((s) => String(s).toLowerCase())
+    : [action === 'BUY' ? 'buy' : 'sell'];
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
-    const box = await page.evaluate((lbl) => {
+    const box = await page.evaluate((lbls) => {
       const vis = (el) => el.offsetParent !== null;
       const modal = [...document.querySelectorAll('.page-window.modal')]
         .find(m => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
       const scope = modal || document;
-      const el = [...scope.querySelectorAll('button, .input-button, [role="button"]')]
-        .filter(vis)
-        .find(b => {
+      const buttons = [...scope.querySelectorAll('button, .input-button, [role="button"]')].filter(vis);
+      for (const lbl of lbls) {
+        const el = buttons.find(b => {
           const t = (b.innerText || '').trim().toLowerCase();
           return t === lbl || t.startsWith(lbl + ' ') || t.startsWith(lbl + ':');
         });
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return null;
-      return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 24) };
-    }, label);
+        if (el) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          return { x: r.x + r.width / 2, y: r.y + r.height / 2, text: (el.innerText || '').trim().slice(0, 24) };
+        }
+      }
+      return null;
+    }, labels);
     if (box) {
-      console.log(`[exness] clicking ticket ${label.toUpperCase()} button: "${box.text}"`);
+      console.log(`[exness] clicking ticket button: "${box.text}"`);
       await page.mouse.click(box.x, box.y);
       await sleep(1000);
       return true;
     }
     await sleep(700);
   }
-  throw new Error(`ticket ${label.toUpperCase()} button not found in the order dialog`);
+  throw new Error(`ticket button not found for labels [${labels.join(', ')}] in the order dialog`);
 }
 
 async function clickVisibleText(page, wanted, timeout = 8000) {
@@ -754,49 +759,221 @@ async function openOrderTicket(page, candidates) {
   await ensureMarketWatchVisible(page);
   await sleep(1000);
 
-  const foundBox = await page.evaluate((cands) => {
+  // Step 1: scroll the right row into view. IMPORTANT FIX: pick the match by
+  // CANDIDATE PRIORITY, not DOM order. The old version filtered by "any
+  // candidate matches" then took the LAST element found — since Market
+  // Watch lists XAUUSD *and* XAUUSD247 side by side once Forex is shown,
+  // that always grabbed XAUUSD247 (it sits later in the list) regardless of
+  // our preferred candidate order, so trades silently went to the wrong
+  // instrument. Verified from the 2026-08-25 log: "Found symbol XAUUSD247"
+  // when XAUUSD (the actual first-priority candidate) was sitting right
+  // above it.
+  const scrolled = await page.evaluate((cands) => {
     const vis = (el) => el.offsetParent !== null;
-    const allEls = [...document.querySelectorAll('*')].filter(vis);
-    const upCands = cands.map((c) => String(c).toUpperCase());
-
-    let matches = allEls.filter((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
-    if (!matches.length) {
-        matches = allEls.filter((e) => upCands.some((c) => (e.innerText || '').trim().toUpperCase().startsWith(c + ',')));
+    const rows = [...document.querySelectorAll('*')].filter((e) => vis(e) && e.childElementCount === 0);
+    for (const c of cands) {
+      const up = String(c).toUpperCase();
+      const exact = rows.filter((e) => (e.innerText || '').trim().toUpperCase() === up);
+      if (exact.length) {
+        const row = exact[exact.length - 1];
+        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return (row.innerText || '').trim();
+      }
     }
-
-    if (!matches.length) return null;
-
-    const row = matches[matches.length - 1];
-    row.scrollIntoView({ block: 'center', behavior: 'instant' });
-
-    const r = row.getBoundingClientRect();
-    return {
-      text: (row.innerText || '').trim(),
-      x: r.x + r.width / 2,
-      y: r.y + r.height / 2
-    };
+    for (const c of cands) {
+      const up = String(c).toUpperCase();
+      const pref = rows.filter((e) => (e.innerText || '').trim().toUpperCase().startsWith(up + ','));
+      if (pref.length) {
+        const row = pref[pref.length - 1];
+        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+        return (row.innerText || '').trim();
+      }
+    }
+    return null;
   }, candidates);
 
-  if (!foundBox) {
+  if (!scrolled) {
     await screenshot(page, 'symbol-not-in-market-watch');
     throw new Error(`Symbol not found in Market Watch list. Candidates tried: ${candidates.join(', ')}. See screenshot.`);
   }
 
-  console.log(`[exness] Found symbol "${foundBox.text}" in Market Watch. Double-clicking to open ticket...`);
+  // Step 2: re-measure AFTER the scroll settles, in a separate round-trip —
+  // reading getBoundingClientRect() in the exact same tick as
+  // scrollIntoView() can race on some renders and hand back stale (pre-
+  // scroll) coordinates, which would double-click on the wrong spot and
+  // silently fail to open anything.
+  await sleep(400);
+  const foundBox = await page.evaluate((wanted) => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('*')]
+      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === wanted);
+    if (!el.length) return null;
+    const row = el[el.length - 1];
+    const r = row.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return null;
+    return { text: wanted, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }, scrolled);
 
+  if (!foundBox) {
+    await screenshot(page, 'symbol-not-in-market-watch');
+    throw new Error(`Symbol "${scrolled}" scrolled into view but its position could not be re-measured. See screenshot.`);
+  }
+
+  console.log(`[exness] Found symbol "${foundBox.text}" in Market Watch. Double-clicking to open ticket...`);
   await page.mouse.click(foundBox.x, foundBox.y, { clickCount: 2, delay: 100 });
-  await sleep(2500);
+  await sleep(2000);
+
+  if (await isOrderTicketOpen(page)) {
+    console.log('[exness] Order ticket successfully opened via double-click.');
+    return;
+  }
+
+  // Fallback: right-click the row -> "New Order" from the context menu.
+  // VERIFIED (2026-08-25 recording) as an equally valid, arguably more
+  // reliable way to open the same ticket — double-click timing can be
+  // finicky in headless Chrome, this doesn't depend on click timing at all.
+  console.warn('[exness] double-click did not open a ticket — retrying via right-click > New Order');
+  await page.mouse.click(foundBox.x, foundBox.y, { button: 'right' });
+  await sleep(900);
+  const newOrderItem = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const el = [...document.querySelectorAll('*')]
+      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === 'New Order');
+    if (!el.length) return null;
+    const r = el[el.length - 1].getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (newOrderItem) {
+    await page.mouse.click(newOrderItem.x, newOrderItem.y);
+    await sleep(2000);
+  } else {
+    await page.keyboard.press('Escape').catch(() => {});
+  }
 
   if (!(await isOrderTicketOpen(page))) {
      await screenshot(page, 'ticket-failed-to-open');
-     throw new Error('Order ticket did not open after double-clicking the symbol in Market Watch.');
+     throw new Error('Order ticket did not open (tried double-click and right-click > New Order).');
   }
 
-  console.log('[exness] Order ticket successfully opened and pre-filled via Market Watch double-click.');
+  console.log('[exness] Order ticket successfully opened via right-click > New Order.');
+}
+
+/** Read the big "bid / ask" price line shown in an open ticket
+ *  (e.g. "4648.518 / 4648.568"), used to work out Limit vs Stop below. */
+async function readTicketPrices(page) {
+  return page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    const scope = modal || document;
+    const el = [...scope.querySelectorAll('*')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .find((e) => /^\d+(\.\d+)?\s*\/\s*\d+(\.\d+)?$/.test((e.innerText || '').trim()));
+    if (!el) return null;
+    const [bid, ask] = el.innerText.trim().split('/').map((s) => parseFloat(s.trim()));
+    return { bid, ask };
+  });
+}
+
+/**
+ * Switch an open ticket from "Market Execution" to "Pending order" and
+ * configure it for a specific entry price.
+ *
+ * NOTE ON CONFIDENCE: verified from a live recording (2026-08-25) that the
+ * ticket's "Type" select has exactly two options, "Market Execution" and
+ * "Pending order" — but the recording didn't carry on to show the expanded
+ * pending-order sub-form (the secondary Buy/Sell Limit/Stop selector, the
+ * Price field, and the submit button's exact label), so those parts below
+ * are implemented generically (label-based field lookup, multiple button-
+ * label fallbacks, screenshots on anything unexpected) rather than against
+ * a confirmed exact layout. If this doesn't match first try, the
+ * 'pending-order-ticket' screenshot plus the thrown error will show exactly
+ * what the real sub-form looks like so it's a quick follow-up fix.
+ */
+async function setPendingOrderMode(page, { action, entryPrice }) {
+  const prices = await readTicketPrices(page);
+
+  // 1) Switch the primary Type select to "Pending order".
+  const switched = await page.evaluate(() => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    const scope = modal || document;
+    const selects = [...scope.querySelectorAll('select')].filter(vis);
+    const typeSelect = selects.find((s) => [...s.options].some((o) => /pending order/i.test(o.text)));
+    if (!typeSelect) return false;
+    const opt = [...typeSelect.options].find((o) => /pending order/i.test(o.text));
+    typeSelect.value = opt.value;
+    typeSelect.dispatchEvent(new Event('input', { bubbles: true }));
+    typeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  });
+  if (!switched) {
+    await screenshot(page, 'pending-order-type-select-not-found');
+    throw new Error('Could not find/switch the ticket\'s Type select to "Pending order". See screenshot.');
+  }
+  await sleep(900);
+  await screenshot(page, 'pending-order-ticket');
+
+  // 2) Work out Limit vs Stop the standard way: a BUY above the current ask
+  //    or a SELL below the current bid only fills on a breakout -> Stop;
+  //    the opposite (waiting for a better/retraced price) -> Limit.
+  let pendingType = null;
+  if (prices && entryPrice != null) {
+    if (action === 'BUY') pendingType = entryPrice > prices.ask ? 'Buy Stop' : 'Buy Limit';
+    else pendingType = entryPrice < prices.bid ? 'Sell Stop' : 'Sell Limit';
+  } else {
+    pendingType = action === 'BUY' ? 'Buy Limit' : 'Sell Limit';
+    console.warn('[exness] could not read current bid/ask — defaulting to', pendingType, '(verify this is what you want)');
+  }
+
+  // 3) Set the secondary Buy/Sell Limit/Stop select, if present.
+  const subTypeSet = await page.evaluate((wanted) => {
+    const vis = (el) => el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
+    const scope = modal || document;
+    const selects = [...scope.querySelectorAll('select')].filter(vis);
+    const subSelect = selects.find((s) => [...s.options].some((o) => /limit|stop/i.test(o.text)));
+    if (!subSelect) return { ok: false, reason: 'no-sub-select' };
+    const opt = [...subSelect.options].find((o) => o.text.trim().toLowerCase() === wanted.toLowerCase());
+    if (!opt) return { ok: false, reason: 'no-matching-option', available: [...subSelect.options].map((o) => o.text) };
+    subSelect.value = opt.value;
+    subSelect.dispatchEvent(new Event('input', { bubbles: true }));
+    subSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true };
+  }, pendingType);
+  if (!subTypeSet.ok) {
+    await screenshot(page, 'pending-order-subtype-not-found');
+    throw new Error(`Could not set the pending order sub-type to "${pendingType}" (${subTypeSet.reason}). See screenshot.`);
+  }
+  console.log('[exness] pending order sub-type set ->', pendingType);
+
+  // 4) Fill the entry Price field.
+  if (entryPrice != null) {
+    let priceEl = await page.$('#price');
+    if (!priceEl) {
+      const handle = await fieldForLabel(page, 'Price');
+      priceEl = handle ? handle.asElement() : null;
+    }
+    if (!priceEl) {
+      await screenshot(page, 'pending-order-price-field-not-found');
+      throw new Error('Could not find the pending order "Price" field. See screenshot.');
+    }
+    await clearAndType(page, priceEl, String(entryPrice));
+    console.log('[exness] set pending Price =', entryPrice);
+  }
+  await sleep(500);
+  return pendingType;
 }
 
 async function placeOrder(page, sig) {
-  const { action, lot, sl, tp } = sig;
+  const { action, lot, sl, tp, entryPrice } = sig;
+  // sig.pending / sig.orderType let the caller force pending mode explicitly;
+  // otherwise we infer it from entryPrice being present (backward compatible
+  // — existing callers that never pass entryPrice keep getting plain market
+  // orders exactly as before).
+  const isPending = sig.pending === true || /^(pending|limit|stop)$/i.test(sig.orderType || '') || entryPrice != null;
   const candidates = terminalSymbolCandidates(sig.pair);
   const pair = candidates[0];
 
@@ -841,17 +1018,34 @@ async function placeOrder(page, sig) {
   if (tp != null) await setInput('tp', 'Take Profit', tp);
   await sleep(1000);
 
-  const ticketOk = await page.evaluate((act) => {
+  let pendingType = null;
+  if (isPending) {
+    if (entryPrice == null) throw new Error('Pending order requested but no entryPrice was provided.');
+    pendingType = await setPendingOrderMode(page, { action, entryPrice });
+  }
+
+  // For a pending order the submit button's label is uncertain (could be
+  // "Place", the sub-type name like "Buy Limit", or still just "Buy") — so
+  // check against a list of plausible labels instead of the single exact
+  // action word used for market orders.
+  const btnLabels = isPending
+    ? [pendingType.toLowerCase(), 'place', action === 'BUY' ? 'buy' : 'sell']
+    : [action === 'BUY' ? 'buy' : 'sell'];
+
+  const ticketOk = await page.evaluate((labels) => {
     const vis = (el) => el.offsetParent !== null;
     const modal = [...document.querySelectorAll('.page-window.modal')]
       .find(m => !/hidden/.test(m.className || '') && m.querySelector('input#volume'));
     const scope = modal || document;
-    const btn = [...scope.querySelectorAll('button, .input-button, [role="button"]')]
-      .filter(vis)
-      .find(b => {
-        const t = (b.innerText || '').trim();
-        return t && new RegExp('^' + act + '(:| |$)', 'i').test(t);
+    const buttons = [...scope.querySelectorAll('button, .input-button, [role="button"]')].filter(vis);
+    let btn = null;
+    for (const lbl of labels) {
+      btn = buttons.find(b => {
+        const t = (b.innerText || '').trim().toLowerCase();
+        return t === lbl || t.startsWith(lbl + ' ') || t.startsWith(lbl + ':');
       });
+      if (btn) break;
+    }
     const val = (id) => {
       const el = scope.querySelector('input#' + id);
       return el ? el.value : null;
@@ -866,9 +1060,10 @@ async function placeOrder(page, sig) {
       volume: val('volume'),
       sl: val('sl'),
       tp: val('tp'),
+      price: val('price'),
       symbolInput: sel ? (sel.options[sel.selectedIndex] ? (sel.options[sel.selectedIndex].text || sel.value) : sel.value) : null,
     };
-  }, action);
+  }, btnLabels);
 
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
   if (!ticketOk.ok || !ticketOk.modalFound || ticketOk.volume !== String(lot)) {
@@ -877,8 +1072,8 @@ async function placeOrder(page, sig) {
     throw new Error(`Order ticket not submittable (btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume=${ticketOk.volume}). See screenshot.`);
   }
 
-  console.log(`[exness] clicking ${action} (ticket-scoped)...`);
-  await clickTicketButton(page, action);
+  console.log(`[exness] clicking ${isPending ? pendingType : action} (ticket-scoped)...`);
+  await clickTicketButton(page, action, isPending ? btnLabels : null);
 
   let confirmed = false;
   let evidence = '';
@@ -946,7 +1141,7 @@ async function placeOrder(page, sig) {
     throw new Error('Order ticket did not close / no position found after clicking ' + action +
       '. Journal: ' + (journalAfter || '(empty)') + ' — see screenshot');
   }
-  return { action, pair, lot, sl, tp, confirmed, evidence };
+  return { action, pair, lot, sl, tp, entryPrice, pendingType, confirmed, evidence };
 }
 
 async function verifyPositionsLive() {
@@ -1072,4 +1267,5 @@ module.exports = {
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
   terminalSymbolCandidates, openOrderTicket, closeOrderTicket, toolbarIconButtons,
   isOrderTicketOpen, focusTerminal, revealHiddenSymbols, symbolAlreadyInMarketWatch,
+  readTicketPrices, setPendingOrderMode,
 };
