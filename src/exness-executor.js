@@ -551,8 +551,8 @@ async function closeOrderTicket(page) {
 async function ensureMarketWatchVisible(page) {
   const hasRows = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
-    return [...document.querySelectorAll('div, span, td, li')]
-      .filter((e) => vis(e) && e.childElementCount === 0)
+    return [...document.querySelectorAll('*')]
+      .filter(vis)
       .some((e) => /^[A-Z]{6}$/.test((e.innerText || '').trim()));
   });
   if (hasRows) return true;
@@ -587,7 +587,16 @@ function terminalSymbolCandidates(pair) {
   const p = String(pair || '').toUpperCase();
   const override = a[pair] || a[p];
   const out = [];
-  if (override) out.push(override);
+  if (override) {
+    // Loud on purpose: an env override silently jumping a symbol to the
+    // front of the candidate list (bypassing the built-in preferred order)
+    // is exactly what caused a "why is it picking XAUUSD247 again?!" report
+    // on 2026-08-25 — the override was a stale SYMBOL_ALIASES env var from
+    // much earlier testing. If you didn't intend to force a specific
+    // symbol, remove/clear SYMBOL_ALIASES in your environment variables.
+    console.warn(`[exness] SYMBOL_ALIASES override active: "${pair}" -> "${override}" (this is tried BEFORE the built-in order below — remove the env var if this isn't intentional)`);
+    out.push(override);
+  }
   if (p === 'XAUUSD' || p === 'GOLD') out.push('XAUUSD', 'XAUUSD247', 'XAUUSDm', 'GOLD');
   else out.push(pair, pair + 'm', pair + '247');
   return [...new Set(out)];
@@ -607,8 +616,8 @@ async function symbolAlreadyInMarketWatch(page, candidates) {
   return page.evaluate((cands) => {
     const vis = (el) => el.offsetParent !== null;
     const upCands = cands.map((c) => String(c).toUpperCase());
-    return [...document.querySelectorAll('div, span, td, li')]
-      .filter((e) => vis(e) && e.childElementCount === 0)
+    return [...document.querySelectorAll('*')]
+      .filter(vis)
       .some((e) => upCands.includes((e.innerText || '').trim().toUpperCase()));
   }, candidates);
 }
@@ -770,7 +779,7 @@ async function openOrderTicket(page, candidates) {
   // above it.
   const scrolled = await page.evaluate((cands) => {
     const vis = (el) => el.offsetParent !== null;
-    const rows = [...document.querySelectorAll('*')].filter((e) => vis(e) && e.childElementCount === 0);
+    const rows = [...document.querySelectorAll('*')].filter(vis);
     for (const c of cands) {
       const up = String(c).toUpperCase();
       const exact = rows.filter((e) => (e.innerText || '').trim().toUpperCase() === up);
@@ -806,7 +815,7 @@ async function openOrderTicket(page, candidates) {
   const foundBox = await page.evaluate((wanted) => {
     const vis = (el) => el.offsetParent !== null;
     const el = [...document.querySelectorAll('*')]
-      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === wanted);
+      .filter((e) => vis(e) && (e.innerText || '').trim() === wanted);
     if (!el.length) return null;
     const row = el[el.length - 1];
     const r = row.getBoundingClientRect();
@@ -838,7 +847,7 @@ async function openOrderTicket(page, candidates) {
   const newOrderItem = await page.evaluate(() => {
     const vis = (el) => el.offsetParent !== null;
     const el = [...document.querySelectorAll('*')]
-      .filter((e) => vis(e) && e.childElementCount === 0 && (e.innerText || '').trim() === 'New Order');
+      .filter((e) => vis(e) && (e.innerText || '').trim() === 'New Order');
     if (!el.length) return null;
     const r = el[el.length - 1].getBoundingClientRect();
     return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
