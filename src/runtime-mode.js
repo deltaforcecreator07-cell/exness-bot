@@ -13,6 +13,7 @@ const path = require('path');
 
 const STATE_DIR = path.join(__dirname, '..', '.runtime', 'state');
 const MODE_FILE = path.join(STATE_DIR, 'mode.json');
+const PAUSE_FILE = path.join(STATE_DIR, 'paused.json');
 
 const VALID = ['log', 'puppeteer'];
 
@@ -33,4 +34,19 @@ function setMode(mode) {
   return { ok: true, message: `Mode set to ${m}` };
 }
 
-module.exports = { currentMode, setMode, VALID };
+/* ---------------- trading pause (owner safety switch) ---------------- */
+
+function isPaused() {
+  try {
+    const d = JSON.parse(fs.readFileSync(PAUSE_FILE, 'utf8'));
+    return !!d.paused;
+  } catch { return false; }
+}
+
+function setPaused(paused) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(PAUSE_FILE, JSON.stringify({ paused: !!paused, at: Date.now() }));
+  return { ok: true, paused: !!paused };
+}
+
+module.exports = { currentMode, setMode, VALID, isPaused, setPaused };

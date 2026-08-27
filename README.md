@@ -29,6 +29,17 @@ confirmation → DM to the OWNER (channels can't receive replies)
 
 ---
 
+## v0.5 — reliable /close, partial closes, entry tolerance, breakeven & more owner commands
+
+1. **`/close` actually works now.** The old code looked for the right-click "Close" menu item with `offsetParent !== null` — GWT context menus are `position: fixed`, where `offsetParent` is always null, so the item was on screen but invisible to the bot. It also could right-click a Market Watch cell instead of the Trade-tab row. Now rows are scoped to the Trade tab (ticket/buy-sell heuristic), visibility uses `checkVisibility()`, the right-click first selects the row, every menu's contents are dumped to the logs, and THREE close strategies run in order (context menu → double-click the row → loose menu match), each with screenshots.
+2. **Selective + partial closes** — `/close 2`, `/close #120548117`, `/close gold`, `/close all` (/flatten), and volume-based partials: `/close 50%`, `/close half`, `/close 2 50%`, `/partial 30`. Partial close = MT5's native way: the close dialog's Volume field is rewritten to the floored-to-0.01 volume, the remainder stays open and tracking is updated.
+3. **Entry tolerance — no trade missed.** `ENTRY_TOLERANCE_USD` (default 3). Live bid/ask is read off the order ticket before submitting. Within ±$3 of the signal zone → still executes at market (drift accepted on purpose). Beyond the band → instead of rejecting or chasing, the bot places a pending order (Buy/Sell Limit/Stop) at the nearest zone edge, and the confirmation message says so. SL/TP the live price already crossed get nudged just beyond it (≤ tolerance) and every adjustment is reported.
+4. **Breakeven** — `/be` moves SL to entry, `/be +50` locks +50 pips, works on a selector too (`/be 2`, `/be #120548117`, `/be gold`).
+5. **More direction words** — `LONG` = BUY, `SHORT` = SELL everywhere (channel signals AND `/trade`).
+6. **Institutional-grade command set** — `/account` (live balance/equity/margin), `/risk` (sizing config + daily usage), `/pause` `/resume` (safety switch: no NEW trades, management still works), `/ping`, `/shot` (terminal screenshot to your DM), plus the existing `/status` `/positions` `/verify` `/mode` `/retake` `/trade` `/help`.
+
+---
+
 ## v0.4 — WhatsApp Channel signal source
 
 Your signal source is a **WhatsApp Channel** (`THE SHARKS`), not a group. This changes three things:
@@ -210,9 +221,26 @@ If a field isn't found, run `npm run dump-dom` and check `.runtime/dom-dump.json
 
 ## Commands in WhatsApp
 
-- `/status` → uptime, memory, mode, Gemini on/off, trades today, open positions
-- `/positions` → tracked open positions (pair, side, lot, entry, SL, TP)
-- any `BUY/SELL ...` message → parsed, risk-checked, executed, confirmed
+Position management (selectors: nothing = most recent, `2` = #2 in /positions, `#120548117` = ticket, `gold`/`xauusdm` = symbol):
+
+- `/close [sel] [%]` → close (e.g. `/close`, `/close 2`, `/close #120548117`, `/close gold 50%`)
+- `/close 50%` (or `half`, `0.5`) → partial close; `/close 2 50%` → half of position #2
+- `/partial 30 [sel]` → alias, defaults to 50%; `/close all` / `/flatten` → close everything
+- `/be [sel] [+pips]` → SL to breakeven (`/be`, `/be +50`, `/be 2`)
+- `/sl <price> [sel]` / `/tp <price> [sel]` → modify levels (e.g. `/sl 4600 2`)
+- `/positions` (aliases `/pos` `/orders`) → tracked positions, numbered
+- `/verify` → read the ACTUAL open positions from the terminal
+- `/account` → balance / equity / margin from the terminal
+- `/risk` → sizing config + today's usage vs caps
+
+Control:
+
+- `/status`, `/ping`, `/shot` (terminal screenshot), `/account`
+- `/pause` / `/resume` → stop/re-start NEW trades (management keeps working)
+- `/mode [log|puppeteer]` → dry-run ↔ real trading instantly
+- `/trade SELL XAUUSD 4392-94 SL 4400 TP 4384` → manual trade (LONG=BUY, SHORT=SELL)
+- `/retake` → re-fire the last saved signal
+- any `BUY/SELL/LONG/SHORT ...` message → parsed, risk-checked, executed, confirmed
 - management instructions (`close kardo`, `SL 401 pe rakhna`, `breakeven kar dana`) → acted on the open position
 
 ## Testing the WhatsApp layer

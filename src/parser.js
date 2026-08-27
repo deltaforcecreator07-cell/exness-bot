@@ -40,6 +40,7 @@ const PAIR_ALIASES = {
 const KEYWORDS = new Set([
   'SL', 'TP', 'LOT', 'ENTRY', 'AT', '@', 'PRICE', 'VOLUME', 'VOL', 'SIZE',
   'STOP', 'TAKE', 'LOSS', 'PROFIT', 'MARKET', 'BUY', 'SELL', 'LIMIT', 'PENDING',
+  'LONG', 'SHORT', // direction aliases -> LONG = BUY, SHORT = SELL
 ]);
 
 // words that look ticker-ish but are channel filler — never a pair
@@ -51,6 +52,7 @@ const NOISE = new Set([
   'TODAY', 'TOMORROW', 'PROMISE', 'MAXIMUM', 'KAHAN', 'SE', 'HE', 'ENTRY',
   'THEN', 'WILL', 'CAN', 'WITH', 'DONE', 'HIT', 'TAPPED', 'RUNNING', 'VOLUME',
   'FALL', 'COMING', 'TRADE', 'SL', 'TP', 'RISK', 'REWARD', 'CLOSE', 'OPEN',
+  'TERM', // "long term" / "short term" chatter — never a pair
 ]);
 
 function num(v) {
@@ -118,9 +120,11 @@ function isLotLike(tok) {
   return v < 100 && (tok.includes('.') || v <= 50);
 }
 
-function findPair(tokens, action) {
+function findPair(tokens, action, actionWord) {
+  const dirWords = new Set(['BUY', 'SELL', 'LONG', 'SHORT']);
+  if (actionWord) dirWords.add(actionWord);
   for (const tok of tokens) {
-    if (tok === action) continue;
+    if (dirWords.has(tok)) continue;
     if (KEYWORDS.has(tok) || NOISE.has(tok)) continue;
     if (/^\d+(\.\d+)?([-–—]\d+)?$/.test(tok)) continue;
     if (PAIR_ALIASES[tok]) return PAIR_ALIASES[tok];
@@ -134,7 +138,8 @@ function parseTradeMessage(text) {
   const clean = cleanText(text);
   if (!clean) return null;
 
-  const actionMatch = clean.match(/\b(BUY|SELL)\b/);
+  // LONG = BUY, SHORT = SELL (common trader shorthand) — normalized below.
+  const actionMatch = clean.match(/\b(BUY|SELL|LONG|SHORT)\b/);
 
   if (!actionMatch && /\b(?:TP|TAKE\s*PROFIT)\b/.test(clean)) {
     const tps = [];
@@ -148,10 +153,11 @@ function parseTradeMessage(text) {
   }
 
   if (!actionMatch) return null;
-  const action = actionMatch[1];
+  const actionWord = actionMatch[1];
+  const action = actionWord === 'LONG' ? 'BUY' : actionWord === 'SHORT' ? 'SELL' : actionWord;
 
   const tokens = clean.split(/\s+/).filter(Boolean);
-  const pair = findPair(tokens, action);
+  const pair = findPair(tokens, action, actionWord);
   if (!pair) return null;
 
   let entryLow = null;
