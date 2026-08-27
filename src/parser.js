@@ -62,10 +62,26 @@ function num(v) {
 function cleanText(text) {
   return String(text)
     .replace(/[*_#`~]/g, ' ')          // bold/italic markers
-    .replace(/[^\x00-\x7F]/g, ' ')     // emojis / non-ascii (Urdu stays ASCII-ish words only)
+    .replace(/[|]/g, ' ')              // "/trade BUY XAUUSD 4605 | SL : 4600"
+    .replace(/[^\x00-\x7F]/g, ' ')     // emojis / non-ascii
     .replace(/\s+/g, ' ')
     .trim()
     .toUpperCase();
+}
+
+/** Next numeric token, skipping leftover punctuation (`SL : 4600`, `SL:4600`). */
+function nextNumber(tokens, i) {
+  const glued = tokens[i].replace(/[,]/g, '');
+  const gluedNum = glued.match(/^(?:SL|TP|STOP|LOT|ENTRY|PRICE|AT|@)[:=]+(\d+(?:\.\d+)?)$/);
+  if (gluedNum) return { value: num(gluedNum[1]), index: i };
+  for (let j = i + 1; j < tokens.length; j++) {
+    const raw = tokens[j];
+    if (/^[,:;=]+$/.test(raw)) continue;
+    const v = num(raw.replace(/^[=:]+/, ''));
+    if (v === null) return { value: null, index: i };
+    return { value: v, index: j };
+  }
+  return { value: null, index: i };
 }
 
 /** Expand a shorthand price: 93 with ref 4391 -> 4393 ; 85 with 4391 -> 4385 */
@@ -90,7 +106,6 @@ function parseRange(tok) {
   let a = num(m[1]);
   let b = num(m[2]);
   if (a === null || b === null) return null;
-  // abbreviation: "4391-93" -> b=93 -> expand against a
   if (b < 1000 && a >= 1000) b = expandShort(b, a);
   if (a > b) [a, b] = [b, a];
   return [a, b];
@@ -107,7 +122,7 @@ function findPair(tokens, action) {
   for (const tok of tokens) {
     if (tok === action) continue;
     if (KEYWORDS.has(tok) || NOISE.has(tok)) continue;
-    if (/^\d+(\.\d+)?([-–—]\d+)?$/.test(tok)) continue; // numbers/ranges
+    if (/^\d+(\.\d+)?([-–—]\d+)?$/.test(tok)) continue;
     if (PAIR_ALIASES[tok]) return PAIR_ALIASES[tok];
     if (/^(X[A-Z]{3,5}|[A-Z]{2,6}\d{1,3}|[A-Z]{4,6})$/.test(tok)) return tok;
   }
@@ -121,7 +136,6 @@ function parseTradeMessage(text) {
 
   const actionMatch = clean.match(/\b(BUY|SELL)\b/);
 
-  // ---- TP-only message (no action): "TP 4401" / "TP 4392 TP 4370" ----
   if (!actionMatch && /\b(?:TP|TAKE\s*PROFIT)\b/.test(clean)) {
     const tps = [];
     const tpRe = /\b(?:TP|TAKE\s*PROFIT)\s*[:=]?\s*(\d+(?:\.\d+)?)/gi;
@@ -148,24 +162,54 @@ function parseTradeMessage(text) {
   const tp = [];
 
   for (let i = 0; i < tokens.length; i++) {
-    let tok = tokens[i].replace(/[,:;]/g, '');
+    const rawTok = tokens[i];
+    let tok = rawTok.replace(/[,:;=]/g, '');
     if (!tok) continue;
+    const glued = rawTok.match(/^(SL|TP|LOT|ENTRY)[:=]+(\d+(?:\.\d+)?)$/i);
+    if (glued) {
+      const kind = glued[1].toUpperCase();
+      const v = num(glued[2]);
+      if (v !== null) {
+        if (kind === 'SL') sl = v;
+        else if (kind === 'TP') tp.push(v);
+        else if (kind === 'LOT') lot = v;
+        else { entry = v; entryLow = v; entryHigh = v; }
+      }
+      continue;
+    }
 
-    if (tok === 'SL') { const v = num(tokens[i + 1]); if (v !== null) { sl = v; i++; } continue; }
-    if (tok === 'STOP' && tokens[i + 1] === 'LOSS') { const v = num(tokens[i + 2]); if (v !== null) { sl = v; i += 2; } continue; }
-    if (tok === 'TP' || (tok === 'TAKE' && tokens[i + 1] === 'PROFIT')) {
-      for (let j = i + 1; j < Math.min(i + 6, tokens.length); j++) {
-        const v = num(tokens[j]);
-        if (v === null || KEYWORDS.has(tokens[j])) break;
+    if (tok === 'SL' || tok.startsWith('SL')) {
+      const n = tok === 'SL' ? nextNumber(tokens, i) : { value: num(tok.replace(/^SL/, '')), index: i };
+      if (n.value !== null) { sl = n.value; i = n.index; }
+      continue;
+    }
+    if (tok === 'STOP' && tokens[i + 1] === 'LOSS') {
+      const n = nextNumber(tokens, i + 1);
+      if (n.value !== null) { sl = n.value; i = n.index; }
+      continue;
+    }
+    if (tok === 'TP' || tok.startsWith('TP') || (tok === 'TAKE' && tokens[i + 1] === 'PROFIT')) {
+      if (tok.startsWith('TP') && tok !== 'TP') {
+        const v = num(tok.replace(/^TP/, ''));
+        if (v !== null) tp.push(v);
+        continue;
+      }
+      const start = tok === 'TAKE' ? i + 1 : i;
+      for (let j = start + 1; j < Math.min(start + 8, tokens.length); j++) {
+        if (/^[,:;=]+$/.test(tokens[j])) continue;
+        const v = num(tokens[j].replace(/^[=:]+/, ''));
+        if (v === null || KEYWORDS.has(tokens[j].replace(/[,:;]/g, ''))) break;
         tp.push(v); i = j;
       }
       continue;
     }
     if (tok === 'LOT' || tok === 'VOLUME' || tok === 'VOL' || tok === 'SIZE') {
-      const v = num(tokens[i + 1]); if (v !== null) { lot = v; i++; } continue;
+      const n = nextNumber(tokens, i); if (n.value !== null) { lot = n.value; i = n.index; } continue;
     }
     if (tok === 'ENTRY' || tok === 'PRICE' || tok === 'AT' || tok === '@') {
-      const v = num(tokens[i + 1]); if (v !== null) { entry = v; entryLow = v; entryHigh = v; i++; } continue;
+      const n = nextNumber(tokens, i);
+      if (n.value !== null) { entry = n.value; entryLow = n.value; entryHigh = n.value; i = n.index; }
+      continue;
     }
     if (entryLow === null) {
       const r = parseRange(tok);
@@ -177,15 +221,25 @@ function parseTradeMessage(text) {
         continue;
       }
     }
-    // everything else is filler
   }
 
-  // expand SL shorthand against the entry zone
+  if (sl === null) {
+    const slM = clean.match(/\b(?:SL|STOP\s*LOSS)\s*[:=]?\s*(\d+(?:\.\d+)?)/i);
+    if (slM) sl = num(slM[1]);
+  }
+  if (!tp.length) {
+    const tpRe = /\b(?:TP|TAKE\s*PROFIT)\s*[:=]?\s*(\d+(?:\.\d+)?)/gi;
+    let m;
+    while ((m = tpRe.exec(clean)) !== null) {
+      const v = num(m[1]);
+      if (v !== null) tp.push(v);
+    }
+  }
+
   if (sl !== null && sl < 1000 && entryLow !== null && entryLow >= 1000) {
     sl = expandShort(sl, entryLow);
   }
 
-  // a real trade needs: an entry (or explicit lot) AND a stop loss
   const hasEntry = entryLow !== null;
   const hasLot = lot !== null;
   if (!(hasEntry || hasLot) || sl === null) return null;
@@ -206,7 +260,6 @@ function parseTradeMessage(text) {
   };
 }
 
-/** Backward-compatible single-message wrapper (used by old tests / quick checks) */
 function parseSignal(text) {
   const r = parseTradeMessage(text);
   if (!r || r.type !== 'signal') return null;
