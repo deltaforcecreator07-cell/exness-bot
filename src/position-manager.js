@@ -20,6 +20,7 @@
  * or run `npm run dump-dom` to re-map the terminal layout.
  */
 const { loginPage, clickVisibleText, clearAndType, fieldForLabel, screenshot, sleep } = require('./exness-executor');
+const { symbolNeedles, symbolsMatch } = require('./fill-evidence');
 
 /* ---------------- low-level terminal ops ---------------- */
 
@@ -29,10 +30,12 @@ async function openTradeTab(page) {
 }
 
 async function findPositionRow(page, pair) {
-  const handle = await page.evaluateHandle((sym) => {
+  const needles = symbolNeedles(pair);
+  const handle = await page.evaluateHandle((syms) => {
+    const up = (syms || []).map((s) => String(s).toUpperCase());
     const cells = [...document.querySelectorAll('td, span, div')]
       .filter((c) => c.offsetParent !== null && c.childElementCount === 0);
-    const cell = cells.find((c) => (c.innerText || '').trim().toUpperCase() === String(sym).toUpperCase());
+    const cell = cells.find((c) => up.includes((c.innerText || '').trim().toUpperCase()));
     if (!cell) return null;
     // walk up to a row-ish container
     let el = cell;
@@ -41,7 +44,7 @@ async function findPositionRow(page, pair) {
       if (el && (el.tagName === 'TR' || /row/i.test(el.className || ''))) return el;
     }
     return cell.parentElement || null;
-  }, pair);
+  }, needles);
   const el = handle.asElement();
   return el || null;
 }
@@ -165,11 +168,14 @@ async function applyManagement(instruction) {
   // pick: pair mentioned in the message, else most recent
   let pos = positions[positions.length - 1];
   if (instruction.pair) {
-    const byPair = positions.find((p) => p.pair.toUpperCase() === String(instruction.pair).toUpperCase());
+    const byPair = positions.find((p) =>
+      symbolsMatch(p.pair, instruction.pair)
+      || symbolsMatch(p.terminalSymbol, instruction.pair)
+      || String(p.pair).toUpperCase() === String(instruction.pair).toUpperCase());
     if (byPair) pos = byPair;
   }
 
-  const pair = pos.pair;
+  const pair = pos.terminalSymbol || pos.pair;
 
   // "BE tapped"/"BE hit" — the trade ALREADY closed at breakeven in the broker
   // (the SL had been moved to entry and got hit). No browser action needed;

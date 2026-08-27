@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { matchFillEvidence, symbolNeedles } = require('./fill-evidence');
 
 const RUNTIME = path.join(__dirname, '..', '.runtime');
 const PROFILE_DIR = path.join(RUNTIME, 'browser-profile');
@@ -976,6 +977,78 @@ async function setPendingOrderMode(page, { action, entryPrice }) {
   return pendingType;
 }
 
+/* ---------------- fill confirmation (MT4 + MT5) ---------------- */
+
+/**
+ * Click a toolbox tab (Trade / History / Journal). Prefer the BOTTOM-most
+ * match so we hit the terminal toolbox, not a similarly named menu item.
+ */
+async function clickToolboxTab(page, name) {
+  const box = await page.evaluate((tab) => {
+    const vis = (el) => el.offsetParent !== null;
+    const candidates = [...document.querySelectorAll('div, span, td, button, a, li')]
+      .filter((e) => vis(e) && e.childElementCount === 0)
+      .filter((e) => (e.innerText || '').trim() === tab)
+      .map((e) => {
+        const r = e.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, top: r.top };
+      })
+      .filter((r) => r.w > 0 && r.w < 160 && r.h > 0 && r.h < 40);
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.top - a.top);
+    return candidates[0];
+  }, name);
+  if (!box) return false;
+  await page.mouse.click(box.x, box.y);
+  await sleep(700);
+  return true;
+}
+
+async function readTicketError(page) {
+  return page.evaluate(() => {
+    const vis = (el) => el && el.offsetParent !== null;
+    const modal = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && vis(m) && m.querySelector('input#volume'));
+    const t = ((modal && modal.innerText) || (document.body && document.body.innerText) || '');
+    const m = t.match(/off quotes|invalid (?:s\/?l|t\/?p|stops)|not enough money|trade (?:disabled|context busy|timeout)|market is closed|requote|invalid volume|common error|order rejected|request rejected/i);
+    return m ? m[0] : null;
+  });
+}
+
+/**
+ * Pull body text + Trade-tab rows out of the page, then run the pure matcher
+ * in Node. The open order ticket is stripped so "Buy by Market" cannot look
+ * like a fill.
+ */
+async function collectFillEvidence(page, opts) {
+  const payload = await page.evaluate(() => {
+    const vis = (el) => el && el.offsetParent !== null;
+    const ticket = [...document.querySelectorAll('.page-window.modal')]
+      .find((m) => !/hidden/.test(m.className || '') && vis(m) && m.querySelector('input#volume'));
+    let body = document.body ? document.body.innerText : '';
+    if (ticket && ticket.innerText) {
+      const tt = ticket.innerText;
+      if (tt && body.includes(tt)) body = body.replace(tt, '\n');
+    }
+    const rows = [];
+    for (const r of document.querySelectorAll('tr, .row, [class*="row" i]')) {
+      if (!vis(r)) continue;
+      const txt = (r.innerText || '').replace(/\s+/g, ' ').trim();
+      if (txt.length >= 10 && txt.length <= 280) rows.push(txt);
+    }
+    const labels = [...document.querySelectorAll('div, span, td')]
+      .filter(vis)
+      .map((e) => (e.innerText || '').trim())
+      .filter((t) => /^#\d{6,}/.test(t));
+    return { body, rows, labels };
+  });
+  return matchFillEvidence(payload.body, opts)
+    || payload.labels.map((l) => matchFillEvidence(l, opts)).find(Boolean)
+    || payload.rows.map((r) => matchFillEvidence(r, opts)).find(Boolean)
+    || matchFillEvidence(payload.rows.join(' | '), opts)
+    || null;
+}
+
 async function placeOrder(page, sig) {
   const { action, lot, sl, tp, entryPrice } = sig;
   // sig.pending / sig.orderType let the caller force pending mode explicitly;
@@ -1084,14 +1157,25 @@ async function placeOrder(page, sig) {
   console.log(`[exness] clicking ${isPending ? pendingType : action} (ticket-scoped)...`);
   await clickTicketButton(page, action, isPending ? btnLabels : null);
 
+  // MT4 "Buy by Market" leaves the order ticket OPEN after a successful fill
+  // (verified 2026-08-26: ticket #120241514 filled in 1s, bot waited 25s for
+  // the ticket to close, then reported "execution failed"). Do NOT require
+  // the ticket to close. Detect the fill from Trade tab / chart labels /
+  // journal phrasing while the ticket may still be on screen.
+  const tradedSymbol = ((ticketOk.symbolInput || '').split(',')[0] || '').trim() || pair;
+  const symbolsForMatch = symbolNeedles(sig.pair, [tradedSymbol, pair, ...candidates]);
+  console.log('[exness] fill-detect symbols:', symbolsForMatch.join(', '));
+  await clickToolboxTab(page, 'Trade').catch(() => {});
+
   let confirmed = false;
   let evidence = '';
+  let ticketId = null;
+  let ticketError = null;
   const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {
     const confirmBox = await page.evaluate(() => {
       const vis = (el) => el.offsetParent !== null;
       const modals = [...document.querySelectorAll('.page-window.modal')].filter(m => !/hidden/.test(m.className || ''));
-      const ticket = modals.find(m => m.querySelector('input#volume'));
       const other = modals.find(m => !m.querySelector('input#volume') && /(buy|sell|order|market)/i.test(m.innerText || ''));
       if (!other) return null;
       const btn = [...other.querySelectorAll('button')].find(b => vis(b) && /^(OK|Yes|Accept)$/i.test((b.innerText || '').trim()));
@@ -1107,32 +1191,37 @@ async function placeOrder(page, sig) {
       continue;
     }
 
-    const ticketStillOpen = await page.evaluate(() => {
-      const vis = (el) => el.offsetParent !== null;
-      const m = [...document.querySelectorAll('.page-window.modal')]
-        .find(x => !/hidden/.test(x.className || '') && x.querySelector('input#volume'));
-      return !!m;
-    });
-
-    if (!ticketStillOpen) {
-      const st = await page.evaluate((sym) => {
-        const t = document.body ? document.body.innerText : '';
-        if (/done!|request accepted|order (executed|placed|accepted|done)|position opened|deal done/i.test(t)) {
-          return { journal: true };
-        }
-        const rows = [...document.querySelectorAll('tr, .row, [class*="row" i]')].filter(r => r.offsetParent !== null);
-        for (const r of rows) {
-          const txt = (r.innerText || '');
-          if (txt.includes(sym) && /\d{4,}/.test(txt) && /(buy|sell)/i.test(txt)) {
-            return { row: txt.replace(/\s+/g, ' ').slice(0, 140) };
-          }
-        }
-        return null;
-      }, pair);
-      if (st) { confirmed = true; evidence = JSON.stringify(st); }
+    ticketError = await readTicketError(page);
+    if (ticketError) {
+      console.warn('[exness] ticket error:', ticketError);
       break;
     }
-    await sleep(1200);
+
+    const st = await collectFillEvidence(page, { action, lot, symbols: symbolsForMatch });
+    if (st) {
+      confirmed = true;
+      evidence = JSON.stringify(st);
+      ticketId = st.ticket || null;
+      console.log('[exness] fill evidence:', evidence);
+      break;
+    }
+    await sleep(800);
+  }
+
+  if (!confirmed && !ticketError) {
+    await clickToolboxTab(page, 'Trade').catch(() => {});
+    await sleep(800);
+    const last = await collectFillEvidence(page, { action, lot, symbols: symbolsForMatch });
+    if (last) {
+      confirmed = true;
+      evidence = JSON.stringify(last);
+      ticketId = last.ticket || null;
+      console.log('[exness] fill evidence (last-ditch Trade tab):', evidence);
+    }
+  }
+
+  if (confirmed) {
+    await closeOrderTicket(page).catch(() => {});
   }
 
   const journalAfter = await page.evaluate(() => {
@@ -1141,16 +1230,33 @@ async function placeOrder(page, sig) {
     if (i < 0) return '(no journal found)';
     return txt.slice(i, i + 600).replace(/\n+/g, ' | ');
   });
+  if (!confirmed) {
+    const fromJournal = matchFillEvidence(journalAfter, { action, lot, symbols: symbolsForMatch });
+    if (fromJournal) {
+      confirmed = true;
+      evidence = JSON.stringify(fromJournal);
+      ticketId = fromJournal.ticket || ticketId;
+      console.log('[exness] fill evidence (journal slice):', evidence);
+    }
+  }
 
   console.log('[exness] JOURNAL AFTER ORDER:', journalAfter);
-  console.log(`[exness] order result: confirmed=${confirmed} evidence=${evidence}`);
+  console.log(`[exness] order result: confirmed=${confirmed} evidence=${evidence} ticket=${ticketId || ''} symbol=${tradedSymbol}`);
 
   await screenshot(page, 'after-order');
+  if (ticketError) {
+    throw new Error('Order rejected: ' + ticketError + ' — see screenshot');
+  }
   if (!confirmed) {
     throw new Error('Order ticket did not close / no position found after clicking ' + action +
       '. Journal: ' + (journalAfter || '(empty)') + ' — see screenshot');
   }
-  return { action, pair, lot, sl, tp, entryPrice, pendingType, confirmed, evidence };
+  return {
+    action,
+    pair: tradedSymbol,
+    terminalSymbol: tradedSymbol,
+    lot, sl, tp, entryPrice, pendingType, confirmed, evidence, ticketId,
+  };
 }
 
 async function verifyPositionsLive() {
