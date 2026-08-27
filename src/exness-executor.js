@@ -8,6 +8,8 @@
 const fs = require('fs');
 const path = require('path');
 const { matchFillEvidence, symbolNeedles } = require('./fill-evidence');
+const { entryTolerance } = require('./risk');
+const { planExecution } = require('./execution-math');
 
 const RUNTIME = path.join(__dirname, '..', '.runtime');
 const PROFILE_DIR = path.join(RUNTIME, 'browser-profile');
@@ -1055,7 +1057,7 @@ async function placeOrder(page, sig) {
   // otherwise we infer it from entryPrice being present (backward compatible
   // — existing callers that never pass entryPrice keep getting plain market
   // orders exactly as before).
-  const isPending = sig.pending === true || /^(pending|limit|stop)$/i.test(sig.orderType || '') || entryPrice != null;
+  const forcedPending = sig.pending === true || /^(pending|limit|stop)$/i.test(sig.orderType || '') || entryPrice != null;
   const candidates = terminalSymbolCandidates(sig.pair);
   const pair = candidates[0];
 
@@ -1083,6 +1085,21 @@ async function placeOrder(page, sig) {
   await openOrderTicket(page, candidates);
   await screenshot(page, 'order-ticket');
 
+  // ---- ENTRY TOLERANCE: plan market vs pending NOW that the ticket is open ----
+  // Gold moves a few dollars between the signal and execution. Within the
+  // tolerance band (default ±$3, env ENTRY_TOLERANCE_USD) we still execute at
+  // market so no trade is missed; beyond it we place a pending order at the
+  // nearest zone edge instead of chasing or rejecting. SL/TP that the live
+  // price already crossed get nudged just beyond it (reported to the owner).
+  const livePrices = await readTicketPrices(page).catch(() => null);
+  const tolerance = entryTolerance(sig.pair);
+  const plan = planExecution(sig, livePrices, tolerance);
+  console.log(`[exness] execution plan (tolerance ±${tolerance}, live=${livePrices ? `bid ${livePrices.bid}/ask ${livePrices.ask}` : 'unavailable'}):`, JSON.stringify(plan));
+  const isPending = plan.mode === 'pending' || forcedPending;
+  const effSl = plan.sl != null ? plan.sl : sl;
+  const effTp = plan.tp != null ? plan.tp : tp;
+  const effEntryPrice = plan.mode === 'pending' ? (plan.entryPrice != null ? plan.entryPrice : entryPrice) : entryPrice;
+
   const setInput = async (id, label, value) => {
     let el = await page.$('#' + id);
     if (!el) {
@@ -1096,14 +1113,14 @@ async function placeOrder(page, sig) {
   };
 
   await setInput('volume', 'Volume', lot);
-  if (sl != null) await setInput('sl', 'Stop Loss', sl);
-  if (tp != null) await setInput('tp', 'Take Profit', tp);
+  if (effSl != null) await setInput('sl', 'Stop Loss', effSl);
+  if (effTp != null) await setInput('tp', 'Take Profit', effTp);
   await sleep(1000);
 
   let pendingType = null;
   if (isPending) {
-    if (entryPrice == null) throw new Error('Pending order requested but no entryPrice was provided.');
-    pendingType = await setPendingOrderMode(page, { action, entryPrice });
+    if (effEntryPrice == null) throw new Error('Pending order requested but no entryPrice was provided.');
+    pendingType = await setPendingOrderMode(page, { action, entryPrice: effEntryPrice });
   }
 
   // For a pending order the submit button's label is uncertain (could be
@@ -1148,7 +1165,7 @@ async function placeOrder(page, sig) {
   }, btnLabels);
 
   console.log('[exness] ticket check before click:', JSON.stringify(ticketOk));
-  if (!ticketOk.ok || !ticketOk.modalFound || ticketOk.volume !== String(lot)) {
+  if (!ticketOk.ok || !ticketOk.modalFound || Math.abs(Number(ticketOk.volume) - Number(lot)) > 1e-8) {
     console.warn(`[exness] ticket not ready: btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume="${ticketOk.volume}" (want "${lot}") sl="${ticketOk.sl}" tp="${ticketOk.tp}" symbol="${ticketOk.symbolInput}"`);
     await screenshot(page, 'ticket-not-submittable');
     throw new Error(`Order ticket not submittable (btn=${ticketOk.btnFound} modal=${ticketOk.modalFound} volume=${ticketOk.volume}). See screenshot.`);
@@ -1255,8 +1272,40 @@ async function placeOrder(page, sig) {
     action,
     pair: tradedSymbol,
     terminalSymbol: tradedSymbol,
-    lot, sl, tp, entryPrice, pendingType, confirmed, evidence, ticketId,
+    lot, sl: effSl, tp: effTp, entryPrice: effEntryPrice, pendingType, confirmed, evidence, ticketId,
+    plannedMode: plan.mode,
+    drift: plan.drift,
+    planReason: plan.reason,
+    adjustments: plan.adjustments,
   };
+}
+
+/**
+ * Best-effort account summary (Balance / Equity / Margin) read straight from
+ * the terminal's Toolbox footer text. Figures depend on the terminal layout —
+ * anything we can't find is reported honestly instead of guessed.
+ */
+async function readAccountSummary() {
+  let browser, page;
+  try {
+    ({ browser, page } = await loginPage());
+    await sleep(2000);
+    const lines = await page.evaluate(() => {
+      const t = document.body ? document.body.innerText : '';
+      return t.split('\n').map((s) => s.trim()).filter(Boolean);
+    });
+    const hits = lines
+      .filter((l) => /(balance|equity|margin|free margin)/i.test(l) && /\d/.test(l) && l.length < 90)
+      .slice(0, 8);
+    if (!hits.length) {
+      return { ok: true, message: 'ℹ️ Could not read account figures from the terminal (Toolbox footer not visible).' };
+    }
+    return { ok: true, message: '💼 Account (live from terminal):\n' + hits.join('\n') };
+  } catch (e) {
+    return { ok: false, message: `❌ Could not read the account: ${e.message}` };
+  } finally {
+    try { if (browser) await browser.close(); } catch {}
+  }
 }
 
 async function verifyPositionsLive() {
@@ -1382,5 +1431,5 @@ module.exports = {
   waitAfterSwitch, switchToMT5, performLogin, setServerField, waitForOkEnabled,
   terminalSymbolCandidates, openOrderTicket, closeOrderTicket, toolbarIconButtons,
   isOrderTicketOpen, focusTerminal, revealHiddenSymbols, symbolAlreadyInMarketWatch,
-  readTicketPrices, setPendingOrderMode,
+  readTicketPrices, setPendingOrderMode, readTicketError, readAccountSummary,
 };

@@ -172,4 +172,38 @@ function todayStats() {
   return state[dayKey()] || { count: 0, lot: 0, seen: {} };
 }
 
-module.exports = { senderAllowed, isProvider, validateSignal, markExecuted, todayStats, contractFor };
+/**
+ * Entry-price tolerance in absolute price units ($ on gold).
+ * The live market drifts between the moment a signal is posted and the moment
+ * the headless browser executes it. Within this band the bot still executes at
+ * market (no trade missed); beyond it, it places a pending order at the zone
+ * edge instead of rejecting. Per-symbol override: ENTRY_TOLERANCE_JSON={"EURUSD":0.003}.
+ */
+function entryTolerance(pair) {
+  let map = {};
+  try { map = JSON.parse(process.env.ENTRY_TOLERANCE_JSON || '{}'); } catch { map = {}; }
+  if (pair) {
+    const p = String(pair).toUpperCase();
+    const base = p.replace(/\d+$/, '');
+    if (map[p] != null) return Math.max(0, Number(map[p]) || 0);
+    if (map[base] != null) return Math.max(0, Number(map[base]) || 0);
+  }
+  // '' / invalid -> default 3 (Number('') is 0, so guard explicitly)
+  const raw = process.env.ENTRY_TOLERANCE_USD;
+  const def = raw != null && String(raw).trim() !== '' ? Number(raw) : 3;
+  return Number.isFinite(def) && def >= 0 ? def : 3;
+}
+
+/** Snapshot of the risk configuration (for the /risk owner command). */
+function riskConfig() {
+  return {
+    capital: Number(process.env.CAPITAL || 3000),
+    riskPercent: Number(process.env.RISK_PERCENT || 5),
+    maxLotPerTrade: Number(process.env.MAX_LOT_PER_TRADE || 0.5),
+    maxTradesPerDay: Number(process.env.MAX_TRADES_PER_DAY || 10),
+    maxLotPerDay: Number(process.env.MAX_LOT_PER_DAY || 2),
+    entryToleranceUsd: entryTolerance(null),
+  };
+}
+
+module.exports = { senderAllowed, isProvider, validateSignal, markExecuted, todayStats, contractFor, entryTolerance, riskConfig };

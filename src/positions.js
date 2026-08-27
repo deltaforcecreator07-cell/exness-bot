@@ -32,6 +32,23 @@ function findIndexByPair(list, pair) {
     || symbolsMatch(p.terminalSymbol, pair));
 }
 
+/**
+ * Resolve a match to a list index. `match` is either a pair string (legacy)
+ * or { ticketId, pair } — ticketId wins when both are given, and symbol
+ * matching understands the gold family (XAUUSD / XAUUSD247 / XAUUSDM / GOLD).
+ */
+function findIndexByMatch(list, match) {
+  if (match == null) return -1;
+  if (typeof match === 'string') return findIndexByPair(list, match);
+  const { ticketId, pair } = match;
+  if (ticketId != null) {
+    const byTicket = list.findIndex((p) => String(p.ticketId || '') === String(ticketId));
+    if (byTicket !== -1) return byTicket;
+  }
+  if (pair != null) return findIndexByPair(list, pair);
+  return -1;
+}
+
 function extractTicketId(result) {
   if (!result) return null;
   if (result.ticketId) return result.ticketId;
@@ -65,23 +82,29 @@ function addPosition(sig, result) {
   return pos;
 }
 
-function updatePosition(pair, patch) {
+function updatePosition(match, patch) {
   const list = load();
-  const idx = findIndexByPair(list, pair);
+  const idx = findIndexByMatch(list, match);
   if (idx === -1) return null;
   list[idx] = { ...list[idx], ...patch };
   save(list);
   return list[idx];
 }
 
-/** Remove a tracked position (after successful close). */
-function closeTracked(pair) {
+/** Remove tracked position(s) (after successful close). Returns removed list. */
+function removePosition(match) {
   const list = load();
-  const i = findIndexByPair(list, pair);
-  if (i === -1) return null;
-  const [removed] = list.splice(i, 1);
+  const idx = findIndexByMatch(list, match);
+  if (idx === -1) return [];
+  const [removed] = list.splice(idx, 1);
   save(list);
-  return removed;
+  return [removed];
+}
+
+/** Legacy alias — remove by pair string. */
+function closeTracked(pair) {
+  const [removed] = removePosition(pair);
+  return removed || null;
 }
 
 function listPositions() { return load(); }
@@ -131,6 +154,6 @@ function loadLastSignal(maxAgeMs = 24 * 60 * 60 * 1000) {
 }
 
 module.exports = {
-  addPosition, updatePosition, closeTracked, listPositions, latestPosition,
+  addPosition, updatePosition, closeTracked, removePosition, listPositions, latestPosition,
   saveLastSignal, loadLastSignal, loadLastSignalRecord, markLastSignalExecuted,
 };

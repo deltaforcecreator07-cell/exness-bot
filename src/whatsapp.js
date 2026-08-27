@@ -33,12 +33,13 @@ const {
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const { parseTradeMessage } = require('./parser');
-const { senderAllowed, isProvider, validateSignal, markExecuted, todayStats } = require('./risk');
+const { senderAllowed, isProvider, validateSignal, markExecuted, todayStats, riskConfig, entryTolerance } = require('./risk');
 const { execute } = require('./executor');
 const { classifyManagement } = require('./manage');
-const { applyManagement } = require('./position-manager');
+const { applyManagement, handleOwnerCommand, terminalScreenshot } = require('./position-manager');
 const { addPosition, listPositions, saveLastSignal, loadLastSignal, loadLastSignalRecord, markLastSignalExecuted } = require('./positions');
-const { currentMode, setMode } = require('./runtime-mode');
+const { currentMode, setMode, isPaused, setPaused } = require('./runtime-mode');
+const { parseOwnerCommand, resolveTargets } = require('./commands');
 
 const SESSION_DIR = path.join(__dirname, '..', '.runtime', 'sessions');
 const TP_WINDOW_MS = Number(process.env.TRADE_TP_WINDOW_MS || 5 * 60 * 1000);
@@ -272,13 +273,13 @@ async function onMessage(msg) {
   // the bot receives your DMs / channel signals at all.
   console.log(`[whatsapp:debug] jid=${jid} fromMe=${isSelf} sender=${sender} txt=${text.slice(0, 80).replace(/\n/g, ' | ')}`);
 
-  // Commands (/trade, /retake, /status, ...) are handled FIRST — before the
+  // Commands (/status, /close, /be, /sl, ...) are handled FIRST — before the
   // fromMe filter — so the owner can DM commands to their own number (self-DM)
   // and they still work. (When you message yourself, fromMe is true because
   // the message comes from the bot's own linked account.)
-  const isCommand = /^\/(status|help|positions|retake|retry|trade|mode|close|cancel|verify)\b/i.test(text.trim());
+  const isCommand = /^\/(status|help|positions|pos|orders|retake|retry|trade|mode|close|closeall|cancel|verify|partial|be|breakeven|sl|tp|flatten|risk|ping|pause|resume|shot|screenshot|account)\b/i.test(text.trim());
   if (isCommand && (isSelf || senderAllowed(sender))) {
-    const reply = await handleCommand(text.trim(), sender);
+    const reply = await handleCommand(text.trim(), sender, jid);
     if (reply) await sock.sendMessage(jid, { text: reply });
     return;
   }
@@ -370,6 +371,10 @@ async function handleIncoming(sender, text) {
  */
 async function autoRetryPending() {
   try {
+    if (isPaused()) {
+      console.log('[auto-retry] trading is PAUSED — not auto-executing the saved signal (use /resume, then /retake).');
+      return;
+    }
     const rec = loadLastSignalRecord();
     if (!rec) return;
     if (rec.executed) return; // already handled
@@ -385,6 +390,12 @@ async function handleTrade(sig) {
   // remember the signal so a missed/failed trade is never lost
   // (auto-retried on next connect, or retaken with /retake)
   if (sig && sig.pair) saveLastSignal(sig);
+
+  // owner safety switch: /pause stops NEW trades but keeps the bot alive
+  if (isPaused()) {
+    markLastSignalExecuted(); // don't auto-fire later; /retake after /resume
+    return '⏸️ Trading is PAUSED — signal NOT executed (saved for /retake).\nUse /resume to enable trading again, then /retake.';
+  }
 
   const verdict = validateSignal(sig);
   if (!verdict.ok) {
@@ -425,104 +436,203 @@ async function handleTrade(sig) {
       (sig.tp != null ? ` | TP ${sig.tp}` : '');
   }
   if (result.mode === 'puppeteer' && result.ok !== false) {
-    addPosition(sig, result);
+    // track the position with the ACTUAL values that were submitted (the
+    // execution plan may have nudged SL/TP or used a pending entry price)
+    addPosition({
+      ...sig,
+      sl: result.sl ?? sig.sl,
+      tp: result.tp ?? sig.tp,
+      entry: result.entryPrice ?? sig.entry,
+    }, result);
   }
-  return `✅ ${sig.action} ${sig.pair} zone ${zone} | lot ${sig.lot} | SL ${sig.sl}` +
-    (sig.tp != null ? ` | TP ${sig.tp}` : '') +
+  let note = '';
+  if (result.plannedMode === 'pending' && result.pendingType) {
+    note += `\n📌 Price drifted ${result.drift != null ? `$${result.drift}` : ''} beyond the zone — placed ${result.pendingType} @ ${result.entryPrice} instead (fills when price returns to the level)`;
+  }
+  if (Array.isArray(result.adjustments) && result.adjustments.length) {
+    note += '\n🛠️ ' + result.adjustments.join('\n🛠️ ');
+  }
+  return `✅ ${sig.action} ${sig.pair} zone ${zone} | lot ${sig.lot} | SL ${result.sl ?? sig.sl}` +
+    (result.tp != null ? ` | TP ${result.tp}` : '') +
     (result.terminalSymbol && result.terminalSymbol !== sig.pair ? ` | ${result.terminalSymbol}` : '') +
     (result.ticketId ? ` | #${result.ticketId}` : '') +
-    (result.confirmed ? ' — order confirmed ✔' : ' — check terminal for confirmation');
+    (result.confirmed ? ' — order confirmed ✔' : ' — check terminal for confirmation') +
+    note;
 }
 
-async function handleCommand(rawCmd, sender) {
-  const cmd = rawCmd.toLowerCase().trim();
-  const s = todayStats();
+async function handleCommand(rawCmd, sender, chatJid = null) {
+  const cmd = parseOwnerCommand(rawCmd);
+  if (!cmd) return helpText(); // unknown /command -> show the menu
 
-  // /trade <signal> — manually enter a trade, e.g.
-  //   /trade SELL XAUUSD 4392-94 SL 4400 TP 4384
-  // Only the owner (ALLOWED_SENDERS) can do this; goes through the same
-  // risk sizing + safety checks as a channel signal.
-  if (cmd.startsWith('/trade ')) {
-    const signalText = rawCmd.replace(/^\/trade\s+/i, '').trim();
-    if (!signalText) return 'Usage: /trade BUY|SELL PAIR ZONE SL <price> TP <price>\nExample: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
-    const parsed = parseTradeMessage(signalText);
-    if (!parsed) return '❌ Could not parse that as a trade.\nUse: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
-    const sig = { ...parsed, tp: parsed.tp && parsed.tp.length ? parsed.tp[0] : null, tps: parsed.tp };
-    if (sig.sl == null) return '❌ No SL found — a stop loss is required.';
-    console.log(`[trade-cmd] owner manual trade from ${sender}: ${signalText}`);
-    return await handleTrade(sig);
-  }
+  switch (cmd.type) {
+    case 'ping':
+      return `🏓 pong — bot alive | mode ${currentMode()} | uptime ${Math.round((Date.now() - startedAt) / 60000)} min`;
 
-  // /mode [log|puppeteer] — switch execution mode instantly without restart
-  // /verify — read ACTUAL open positions from the terminal (real-time ground truth)
-  if (cmd === '/verify') {
-    const { verifyPositionsLive } = require('./exness-executor');
-    const res = await verifyPositionsLive();
-    return res.message;
-  }
+    case 'help':
+      return helpText();
 
-  // /close (alias /cancel) — close the latest tracked position in the terminal
-  if (cmd === '/close' || cmd === '/cancel') {
-    const ps = listPositions();
-    if (!ps.length) return 'ℹ️ No tracked position to close. (If the bot restarted, tracking reset — close it in the MT app manually.)';
-    const latest = ps[ps.length - 1];
-    const res = await applyManagement({ action: 'close_position', pair: latest.pair, message: `close ${latest.pair} position` });
-    return res.message;
-  }
+    case 'status': {
+      const ps = listPositions();
+      const s = todayStats();
+      return [
+        '🤖 exness-signal-bot',
+        `mode: ${currentMode()} | trading: ${isPaused() ? '⏸️ PAUSED' : '▶️ active'}`,
+        `llm: ${process.env.GEMINI_API_KEY ? 'gemini ✔' : 'rules only'}`,
+        `channel: ${process.env.ALLOWED_CHANNELS || '(none)'}`,
+        `group: ${process.env.ALLOWED_GROUPS || '(none)'}`,
+        `uptime: ${Math.round((Date.now() - startedAt) / 60000)} min`,
+        `rss: ${fmtMB(process.memoryUsage().rss)} MB`,
+        `trades today: ${s.count} (${s.lot} lot)`,
+        `open tracked: ${ps.length}`,
+      ].join('\n');
+    }
 
-  if (cmd === '/mode' || cmd.startsWith('/mode ')) {
-    const arg = rawCmd.replace(/^\/mode\s*/i, '').trim().toLowerCase();
-    if (!arg) return `Current mode: ${currentMode()}\nUsage: /mode log | /mode puppeteer\n(log = dry-run, puppeteer = real trade)`;
-    const r = setMode(arg);
-    return r.message + ` (now: ${currentMode()})`;
-  }
+    case 'risk': {
+      const c = riskConfig();
+      const s = todayStats();
+      return [
+        '⚖️ Risk configuration',
+        `capital: $${c.capital} | risk/trade: ${c.riskPercent}%`,
+        `max lot/trade: ${c.maxLotPerTrade} | max trades/day: ${c.maxTradesPerDay} | max lot/day: ${c.maxLotPerDay}`,
+        `entry tolerance: ±$${c.entryToleranceUsd} (ENTRY_TOLERANCE_USD)`,
+        `today used: ${s.count}/${c.maxTradesPerDay} trades, ${s.lot}/${c.maxLotPerDay} lot`,
+        `execution mode: ${currentMode()}`,
+      ].join('\n');
+    }
 
-  if (cmd === '/status') {
-    const ps = listPositions();
-    return [
-      '🤖 exness-signal-bot',
-      `mode: ${currentMode()}`,
-      `llm: ${process.env.GEMINI_API_KEY ? 'gemini ✔' : 'rules only'}`,
-      `channel: ${process.env.ALLOWED_CHANNELS || '(none)'}`,
-      `group: ${process.env.ALLOWED_GROUPS || '(none)'}`,
-      `uptime: ${Math.round((Date.now() - startedAt) / 60000)} min`,
-      `rss: ${fmtMB(process.memoryUsage().rss)} MB`,
-      `trades today: ${s.count} (${s.lot} lot)`,
-      `open tracked: ${ps.length}`,
-    ].join('\n');
+    case 'pause': {
+      if (isPaused()) return '⏸️ Already paused. /resume to enable trading.';
+      setPaused(true);
+      return '⏸️ Trading PAUSED — channel signals are saved but NOT executed. Management commands (/close /be /sl /tp) still work. Use /resume to trade again.';
+    }
+    case 'resume': {
+      if (!isPaused()) return '▶️ Trading is already active.';
+      setPaused(false);
+      return '▶️ Trading RESUMED. Use /retake to re-fire the last saved signal if needed.';
+    }
+
+    case 'mode': {
+      if (!cmd.arg) {
+        return `Current mode: ${currentMode()}\nUsage: /mode log | /mode puppeteer\n(log = dry-run, puppeteer = real trade)`;
+      }
+      const r = setMode(cmd.arg);
+      return r.message + ` (now: ${currentMode()})`;
+    }
+
+    case 'positions': {
+      const ps = listPositions();
+      if (!ps.length) return 'No tracked open positions. Use /verify to read the terminal directly.';
+      return ps.map((p, i) =>
+        `${i + 1}. ${p.side} ${p.terminalSymbol || p.pair} ${p.lot} lot @ ${p.entry ?? '?'}`
+        + ` | SL ${p.sl ?? '-'} | TP ${p.tp ?? '-'}`
+        + (p.ticketId ? ` | #${p.ticketId}` : '')
+        + ` | opened ${new Date(p.openedAt).toLocaleTimeString()}`,
+      ).join('\n');
+    }
+
+    case 'verify': {
+      const { verifyPositionsLive } = require('./exness-executor');
+      const res = await verifyPositionsLive();
+      return res.message;
+    }
+
+    case 'account': {
+      const { readAccountSummary } = require('./exness-executor');
+      const res = await readAccountSummary();
+      return res.message;
+    }
+
+    case 'shot': {
+      const res = await terminalScreenshot();
+      if (res.ok && res.path && sock) {
+        try {
+          await sock.sendMessage(chatJid || jidOf(sender), { image: { url: res.path }, caption: '📸 Terminal right now' });
+          return null; // image already sent
+        } catch (e) {
+          return `📸 Screenshot saved (${res.path}) but sending failed: ${e.message}`;
+        }
+      }
+      return res.message || '❌ Could not take a screenshot.';
+    }
+
+    case 'trade': {
+      const signalText = cmd.arg;
+      if (!signalText) return 'Usage: /trade BUY|SELL|LONG|SHORT PAIR ZONE SL <price> TP <price>\nExample: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
+      const parsed = parseTradeMessage(signalText);
+      if (!parsed) return '❌ Could not parse that as a trade.\nUse: /trade SELL XAUUSD 4392-94 SL 4400 TP 4384';
+      const sig = { ...parsed, tp: parsed.tp && parsed.tp.length ? parsed.tp[0] : null, tps: parsed.tp };
+      if (sig.sl == null) return '❌ No SL found — a stop loss is required.';
+      console.log(`[trade-cmd] owner manual trade from ${sender}: ${signalText}`);
+      return await handleTrade(sig);
+    }
+
+    case 'retake': {
+      const last = loadLastSignal();
+      if (!last) return 'ℹ️ No recent signal stored. Wait for the next signal from the channel.';
+      const zone = last.entryLow != null && last.entryHigh != null && last.entryLow !== last.entryHigh
+        ? `${last.entryLow}-${last.entryHigh}`
+        : (last.entry != null ? String(last.entry) : 'market');
+      const msg = `🔁 Retaking last signal: ${last.action} ${last.pair} zone ${zone} | SL ${last.sl}` +
+        (last.tp != null ? ` | TP ${last.tp}` : '');
+      const result = await handleTrade(last);
+      return `${msg}\n${result}`;
+    }
+
+    // ---- browser operations (close / be / sl / tp) ----
+    case 'close':
+    case 'breakeven':
+    case 'sl':
+    case 'tp': {
+      const reply = await handleOwnerCommand(cmd);
+      return reply || `ℹ️ Nothing done for ${cmd.type}.`;
+    }
+
+    default:
+      return helpText();
   }
-  if (cmd === '/positions') {
-    const ps = listPositions();
-    if (!ps.length) return 'No tracked open positions.';
-    return ps.map((p, i) =>
-      `${i + 1}. ${p.side} ${p.terminalSymbol || p.pair} ${p.lot} lot @ ${p.entry ?? '?'}`
-      + ` | SL ${p.sl ?? '-'} | TP ${p.tp ?? '-'}`
-      + (p.ticketId ? ` | #${p.ticketId}` : '')
-      + ` | opened ${new Date(p.openedAt).toLocaleTimeString()}`,
-    ).join('\n');
-  }
-  if (cmd === '/retake' || cmd === '/retry') {
-    const last = loadLastSignal();
-    if (!last) return 'ℹ️ No recent signal stored. Wait for the next signal from the channel.';
-    const zone = last.entryLow != null && last.entryHigh != null && last.entryLow !== last.entryHigh
-      ? `${last.entryLow}-${last.entryHigh}`
-      : (last.entry != null ? String(last.entry) : 'market');
-    const msg = `🔁 Retaking last signal: ${last.action} ${last.pair} zone ${zone} | SL ${last.sl}` +
-      (last.tp != null ? ` | TP ${last.tp}` : '');
-    // acknowledge, then attempt execution
-    const result = await handleTrade(last);
-    return `${msg}\n${result}`;
-  }
+}
+
+function jidOf(sender) {
+  const j = String(sender || '');
+  return j.includes('@') ? j : j + '@s.whatsapp.net';
+}
+
+function helpText() {
   return [
-    '🤖 exness-signal-bot — commands:',
-    '/status — bot status (shows current mode)',
-    '/mode [log|puppeteer] — switch dry-run ↔ real trading instantly (no restart)',
-    '/close (or /cancel) — close the latest position',
-    '/verify — check ACTUAL open positions in the terminal (real-time)',
-    '/positions — tracked open positions',
-    '/retake — retry the last signal (e.g. if a trade was missed while price is still at entry)',
-    '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manually enter a trade (owner only)',
-    'Signals are only read from the configured channel + provider.',
+    '🤖 exness-signal-bot — owner commands',
+    '',
+    '📊 Info',
+    '/status — bot status (mode, uptime, trades today)',
+    '/positions — tracked open positions (numbered for /close 2)',
+    '/verify — read ACTUAL open positions from the terminal',
+    '/account — balance / equity / margin from the terminal',
+    '/risk — risk settings + today’s usage',
+    '/ping — liveness check',
+    '/shot — screenshot of the terminal right now',
+    '',
+    '🎯 Trade management',
+    '/close — close the most recent position',
+    '/close 2 — close position #2 (numbering from /positions)',
+    '/close #120548117 — close by ticket id',
+    '/close gold — close by symbol (xauusd, xauusdm, gold…)',
+    '/close 50% (or: half | 0.5) — close HALF the volume',
+    '/close 2 50% — close half of position #2',
+    '/partial 30 — alias: close 30% (default 50%)',
+    '/close all (or /flatten) — close EVERYTHING',
+    '/be — move SL to breakeven (entry)',
+    '/be +50 — breakeven +50 pips (locks profit)',
+    '/be 2 | /be #120548117 — breakeven a specific position',
+    '/sl 4600 [sel] — set Stop Loss (e.g. /sl 4600 2)',
+    '/tp 4650 [sel] — set Take Profit',
+    '',
+    '⚙️ Control',
+    '/trade SELL XAUUSD 4392-94 SL 4400 TP 4384 — manual trade (LONG=BUY, SHORT=SELL)',
+    '/retake — retry the last saved signal',
+    '/pause — stop NEW trades (management still works)',
+    '/resume — enable trading again',
+    '/mode [log|puppeteer] — dry-run ↔ real trading',
+    '',
+    `Signals are only read from the configured channel/group. Entry tolerance: ±$${entryTolerance('XAUUSD')} on gold.`,
   ].join('\n');
 }
 

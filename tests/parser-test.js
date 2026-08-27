@@ -28,6 +28,20 @@ function none(label, input) {
 sig('GOLD BUY zone + shorthand SL', 'GOLD BUY 4391-93 SL 85',
   { action: 'BUY', pair: 'XAUUSD', entryLow: 4391, entryHigh: 4393, sl: 4385, lot: null });
 
+/* ---- LONG = BUY, SHORT = SELL ---- */
+sig('GOLD LONG zone (LONG = BUY)', 'GOLD LONG 4391-93 SL 85',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4391, entryHigh: 4393, sl: 4385, lot: null });
+sig('GOLD SHORT zone (SHORT = SELL)', 'GOLD SHORT 4400-02 SL 08',
+  { action: 'SELL', pair: 'XAUUSD', entryLow: 4400, entryHigh: 4402, sl: 4408, lot: null });
+sig('US30 SHORT full SL', 'US30 SHORT 44000-44010 SL 44050',
+  { action: 'SELL', pair: 'US30', entryLow: 44000, entryHigh: 44010, sl: 44050, lot: null });
+sig('BUY after LONG term chatter', 'LONG TERM GOLD BUY 4391-93 SL 85',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4391, entryHigh: 4393, sl: 4385, lot: null });
+sig('long lowercase', 'gold long 4607 sl 4600 tp 4620',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4607, entryHigh: 4607, sl: 4600, tp: [4620] });
+sig('short lowercase', 'gold short 4607 sl 4614',
+  { action: 'SELL', pair: 'XAUUSD', entryLow: 4607, entryHigh: 4607, sl: 4614, lot: null });
+
 sig('GOLD BUY bold zone + full SL', 'GOLD BUY **4398-4400** SL 4392',
   { action: 'BUY', pair: 'XAUUSD', entryLow: 4398, entryHigh: 4400, sl: 4392, lot: null });
 

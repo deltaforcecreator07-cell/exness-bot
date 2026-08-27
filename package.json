@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dump-dom": "node src/dump-dom.js",
-    "test": "node tests/parser-test.js && node tests/manage-test.js && node tests/config-test.js && node tests/fill-evidence-test.js",
+    "test": "node tests/parser-test.js && node tests/manage-test.js && node tests/config-test.js && node tests/fill-evidence-test.js && node tests/commands-test.js && node tests/execution-math-test.js",
     "test:wa": "node tests/wa-connect-test.js",
     "postinstall": "puppeteer browsers install chrome-headless-shell"
   },
