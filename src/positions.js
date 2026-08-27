@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { symbolsMatch } = require('./fill-evidence');
 
 const STATE_DIR = path.join(__dirname, '..', '.runtime', 'state');
 const FILE = path.join(STATE_DIR, 'positions.json');
@@ -24,12 +25,32 @@ function save(list) {
   fs.writeFileSync(FILE, JSON.stringify(list));
 }
 
+function findIndexByPair(list, pair) {
+  return list.findIndex((p) =>
+    p.pair === pair
+    || symbolsMatch(p.pair, pair)
+    || symbolsMatch(p.terminalSymbol, pair));
+}
+
+function extractTicketId(result) {
+  if (!result) return null;
+  if (result.ticketId) return result.ticketId;
+  if (!result.evidence) return null;
+  try {
+    const ev = typeof result.evidence === 'string' ? JSON.parse(result.evidence) : result.evidence;
+    return (ev && ev.ticket) || null;
+  } catch { return null; }
+}
+
 /** Record a position after a successful execution. */
 function addPosition(sig, result) {
   const list = load();
+  const terminalSymbol = (result && (result.terminalSymbol || result.pair)) || sig.pair;
   const pos = {
     id: crypto.createHash('sha1').update(Date.now() + sig.pair + Math.random()).digest('hex').slice(0, 10),
     pair: sig.pair,
+    terminalSymbol,
+    ticketId: extractTicketId(result),
     side: sig.action,
     lot: sig.lot,
     entry: sig.entry ?? (sig.entryLow != null && sig.entryHigh != null
@@ -46,7 +67,7 @@ function addPosition(sig, result) {
 
 function updatePosition(pair, patch) {
   const list = load();
-  const idx = list.findIndex((p) => p.pair === pair);
+  const idx = findIndexByPair(list, pair);
   if (idx === -1) return null;
   list[idx] = { ...list[idx], ...patch };
   save(list);
@@ -56,7 +77,7 @@ function updatePosition(pair, patch) {
 /** Remove a tracked position (after successful close). */
 function closeTracked(pair) {
   const list = load();
-  const i = list.findIndex((p) => p.pair === pair);
+  const i = findIndexByPair(list, pair);
   if (i === -1) return null;
   const [removed] = list.splice(i, 1);
   save(list);

@@ -429,6 +429,8 @@ async function handleTrade(sig) {
   }
   return `✅ ${sig.action} ${sig.pair} zone ${zone} | lot ${sig.lot} | SL ${sig.sl}` +
     (sig.tp != null ? ` | TP ${sig.tp}` : '') +
+    (result.terminalSymbol && result.terminalSymbol !== sig.pair ? ` | ${result.terminalSymbol}` : '') +
+    (result.ticketId ? ` | #${result.ticketId}` : '') +
     (result.confirmed ? ' — order confirmed ✔' : ' — check terminal for confirmation');
 }
 
@@ -493,7 +495,10 @@ async function handleCommand(rawCmd, sender) {
     const ps = listPositions();
     if (!ps.length) return 'No tracked open positions.';
     return ps.map((p, i) =>
-      `${i + 1}. ${p.side} ${p.pair} ${p.lot} lot @ ${p.entry ?? '?'} | SL ${p.sl ?? '-'} | TP ${p.tp ?? '-'} | opened ${new Date(p.openedAt).toLocaleTimeString()}`,
+      `${i + 1}. ${p.side} ${p.terminalSymbol || p.pair} ${p.lot} lot @ ${p.entry ?? '?'}`
+      + ` | SL ${p.sl ?? '-'} | TP ${p.tp ?? '-'}`
+      + (p.ticketId ? ` | #${p.ticketId}` : '')
+      + ` | opened ${new Date(p.openedAt).toLocaleTimeString()}`,
     ).join('\n');
   }
   if (cmd === '/retake' || cmd === '/retry') {
