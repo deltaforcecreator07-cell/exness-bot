@@ -25,7 +25,6 @@ function none(label, input) {
   console.log('ok  ', label);
 }
 
-/* ---- real Sharks-format signals ---- */
 sig('GOLD BUY zone + shorthand SL', 'GOLD BUY 4391-93 SL 85',
   { action: 'BUY', pair: 'XAUUSD', entryLow: 4391, entryHigh: 4393, sl: 4385, lot: null });
 
@@ -44,12 +43,22 @@ sig('GOLD BUY with inline TP', 'GOLD BUY 4398-4400 SL 4392 TP 4408 TP 4420',
 sig('classic simple format still works', 'BUY XAUUSD 0.1 SL 2005 TP 2020',
   { action: 'BUY', pair: 'XAUUSD', lot: 0.1, sl: 2005, tp: [2020] });
 
-/* ---- TP-only messages ---- */
+sig('/trade Gold with pipes and Sl :', 'Gold buy 4605 | Sl : 4600 tp 4620',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4605, entryHigh: 4605, sl: 4600, tp: [4620] });
+
+sig('/trade BUY XAUUSD pipes + Sl :', 'BUY XAUUSD 4605 | Sl : 4600 tp 4620',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4605, entryHigh: 4605, sl: 4600, tp: [4620] });
+
+sig('glued SL: TP:', 'GOLD BUY 4605 SL:4600 TP:4620',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4605, entryHigh: 4605, sl: 4600, tp: [4620] });
+
+sig('single entry no zone', 'BUY XAUUSD 4605 SL 4600 TP 4620',
+  { action: 'BUY', pair: 'XAUUSD', entryLow: 4605, entryHigh: 4605, sl: 4600, tp: [4620] });
+
 tp('TP pair 1', 'TP 4401\nTP 4410', [4401, 4410]);
 tp('TP pair 2 (sell)', 'TP 4392 TP 4370', [4392, 4370]);
 tp('TP pair 3', 'TP 4393 TP 4400', [4393, 4400]);
 
-/* ---- must NOT be trades ---- */
 none('GOLD BUY NOW! (no entry/SL)', 'GOLD BUY NOW!');
 none('SL trail update', 'TRAIL SL TO 93');
 none('SL pips update', 'SL -60 PIPS!');
